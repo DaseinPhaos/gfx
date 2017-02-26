@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::{ffi, fmt, mem, str};
 use gl;
-use gfx_core::Capabilities;
+use core::Capabilities;
 
 
 /// A version number for a specific component of an OpenGL implementation
@@ -229,10 +229,12 @@ impl Info {
 /// capabilities.
 pub fn get(gl: &gl::Gl) -> (Info, Capabilities, PrivateCaps) {
     let info = Info::get(gl);
+    let tessellation_supported =           info.is_version_or_extension_supported(4, 0, "GL_ARB_tessellation_shader");
     let caps = Capabilities {
         max_vertex_count: get_usize(gl, gl::MAX_ELEMENTS_VERTICES),
         max_index_count:  get_usize(gl, gl::MAX_ELEMENTS_INDICES),
         max_texture_size: get_usize(gl, gl::MAX_TEXTURE_SIZE),
+        max_patch_size: if tessellation_supported { get_usize(gl, gl::MAX_PATCH_VERTICES) } else {0},
 
         instance_base_supported:           info.is_version_or_extension_supported(4, 2, "GL_ARB_base_instance"),
         instance_call_supported:           info.is_version_or_extension_supported(3, 1, "GL_ARB_draw_instanced"),
@@ -242,6 +244,9 @@ pub fn get(gl: &gl::Gl) -> (Info, Capabilities, PrivateCaps) {
         constant_buffer_supported:         info.is_version_or_extension_supported(3, 1, "GL_ARB_uniform_buffer_object"),
         unordered_access_view_supported:   info.is_version_supported(4, 0), //TODO: extension
         separate_blending_slots_supported: info.is_version_or_extension_supported(4, 0, "GL_ARB_draw_buffers_blend"),
+        copy_buffer_supported:             info.is_version_or_extension_supported(3, 1, "GL_ARB_copy_buffer") |
+                                           info.is_embedded_version_supported(3, 0) |
+                                          (info.is_embedded_version_supported(2, 0) & info.is_extension_supported("GL_NV_copy_buffer")),
     };
     let private = PrivateCaps {
         array_buffer_supported:            info.is_version_or_extension_supported(3, 0, "GL_ARB_vertex_array_object"),
@@ -251,8 +256,7 @@ pub fn get(gl: &gl::Gl) -> (Info, Capabilities, PrivateCaps) {
         sampler_objects_supported:         info.is_version_or_extension_supported(3, 3, "GL_ARB_sampler_objects"),
         program_interface_supported:       info.is_version_or_extension_supported(4, 3, "GL_ARB_program_interface_query"),
         buffer_storage_supported:          info.is_version_or_extension_supported(4, 4, "GL_ARB_buffer_storage"),
-        clear_buffer_supported:            info.is_version_supported(3, 0) |  //TODO: extension
-                                           info.is_embedded_version_supported(3, 0),
+        clear_buffer_supported:            info.is_version_supported(3, 0) | info.is_embedded_version_supported(3, 0),
     };
     (info, caps, private)
 }

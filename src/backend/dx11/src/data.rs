@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use winapi::*;
-use gfx_core::factory::{Bind, MapAccess, Usage};
-use gfx_core::format::{Format, SurfaceType};
-use gfx_core::state::Comparison;
-use gfx_core::tex::{AaMode, FilterMethod, WrapMode, DepthStencilFlags};
+use core::memory::{self, Bind, Usage};
+use core::format::{Format, SurfaceType};
+use core::state::Comparison;
+use core::texture::{AaMode, FilterMethod, WrapMode, DepthStencilFlags};
 
 
 pub fn map_function(fun: Comparison) -> D3D11_COMPARISON_FUNC {
@@ -33,8 +33,8 @@ pub fn map_function(fun: Comparison) -> D3D11_COMPARISON_FUNC {
 }
 
 pub fn map_format(format: Format, is_target: bool) -> Option<DXGI_FORMAT> {
-    use gfx_core::format::SurfaceType::*;
-    use gfx_core::format::ChannelType::*;
+    use core::format::SurfaceType::*;
+    use core::format::ChannelType::*;
     Some(match format.0 {
         R4_G4 | R4_G4_B4_A4 | R5_G5_B5_A1 | R5_G6_B5 => return None,
         R8 => match format.1 {
@@ -117,6 +117,10 @@ pub fn map_format(format: Format, is_target: bool) -> Option<DXGI_FORMAT> {
             Float => DXGI_FORMAT_R32G32B32A32_FLOAT,
             _ => return None,
         },
+        B8_G8_R8_A8 => match format.1 {
+            Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+            _ => return None,
+        },
         D16 => match (is_target, format.1) {
             (true, _)      => DXGI_FORMAT_D16_UNORM,
             (false, Unorm) => DXGI_FORMAT_R16_UNORM,
@@ -142,7 +146,7 @@ pub fn map_format(format: Format, is_target: bool) -> Option<DXGI_FORMAT> {
 }
 
 pub fn map_surface(surface: SurfaceType) -> Option<DXGI_FORMAT> {
-    use gfx_core::format::SurfaceType::*;
+    use core::format::SurfaceType::*;
     Some(match surface {
         R4_G4 | R4_G4_B4_A4 | R5_G5_B5_A1 | R5_G6_B5 => return None,
         R16_G16_B16 => return None,
@@ -158,6 +162,7 @@ pub fn map_surface(surface: SurfaceType) -> Option<DXGI_FORMAT> {
         R32_G32         => DXGI_FORMAT_R32G32_TYPELESS,
         R32_G32_B32     => DXGI_FORMAT_R32G32B32_TYPELESS,
         R32_G32_B32_A32 => DXGI_FORMAT_R32G32B32A32_TYPELESS,
+        B8_G8_R8_A8     => DXGI_FORMAT_B8G8R8A8_TYPELESS,
         D16             => DXGI_FORMAT_R16_TYPELESS,
         D24 | D24_S8    => DXGI_FORMAT_R24G8_TYPELESS,
         D32             => DXGI_FORMAT_R32_TYPELESS,
@@ -182,38 +187,39 @@ pub fn map_anti_alias(aa: AaMode) -> DXGI_SAMPLE_DESC {
 }
 
 pub fn map_bind(bind: Bind) -> D3D11_BIND_FLAG {
-    use gfx_core::factory as f;
     let mut flags = D3D11_BIND_FLAG(0);
-    if bind.contains(f::RENDER_TARGET) {
+    if bind.contains(memory::RENDER_TARGET) {
         flags = flags | D3D11_BIND_RENDER_TARGET;
     }
-    if bind.contains(f::DEPTH_STENCIL) {
+    if bind.contains(memory::DEPTH_STENCIL) {
         flags = flags | D3D11_BIND_DEPTH_STENCIL;
     }
-    if bind.contains(f::SHADER_RESOURCE) {
+    if bind.contains(memory::SHADER_RESOURCE) {
         flags = flags | D3D11_BIND_SHADER_RESOURCE;
     }
-    if bind.contains(f::UNORDERED_ACCESS) {
+    if bind.contains(memory::UNORDERED_ACCESS) {
         flags = flags | D3D11_BIND_UNORDERED_ACCESS;
     }
     flags
 }
 
-
-pub fn map_access(access: MapAccess) -> D3D11_CPU_ACCESS_FLAG {
-    match access {
-        MapAccess::Readable => D3D11_CPU_ACCESS_READ,
-        MapAccess::Writable => D3D11_CPU_ACCESS_WRITE,
-        MapAccess::RW => D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE,
-    }
+pub fn map_access(access: memory::Access) -> D3D11_CPU_ACCESS_FLAG {
+    let mut r = D3D11_CPU_ACCESS_FLAG(0);
+    if access.contains(memory::READ) { r = r | D3D11_CPU_ACCESS_READ }
+    if access.contains(memory::WRITE) { r = r | D3D11_CPU_ACCESS_WRITE }
+    r
 }
 
-pub fn map_usage(usage: Usage) -> (D3D11_USAGE, D3D11_CPU_ACCESS_FLAG) {
+pub fn map_usage(usage: Usage, bind: Bind) -> (D3D11_USAGE, D3D11_CPU_ACCESS_FLAG) {
     match usage {
-        Usage::GpuOnly => (D3D11_USAGE_DEFAULT,   D3D11_CPU_ACCESS_FLAG(0)),
-        Usage::Const   => (D3D11_USAGE_IMMUTABLE, D3D11_CPU_ACCESS_FLAG(0)),
-        Usage::Dynamic => (D3D11_USAGE_DYNAMIC,   D3D11_CPU_ACCESS_WRITE),
-        Usage::CpuOnly(access) => (D3D11_USAGE_STAGING, map_access(access)),
+        Usage::Data => if bind.is_mutable() {
+            (D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0))
+        } else {
+            (D3D11_USAGE_IMMUTABLE, D3D11_CPU_ACCESS_FLAG(0))
+        },
+        Usage::Dynamic => (D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE),
+        Usage::Upload => (D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_WRITE),
+        Usage::Download => (D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ),
     }
 }
 
@@ -234,7 +240,7 @@ pub enum FilterOp {
 }
 
 pub fn map_filter(filter: FilterMethod, op: FilterOp) -> D3D11_FILTER {
-    use gfx_core::tex::FilterMethod::*;
+    use core::texture::FilterMethod::*;
     match op {
         FilterOp::Product => match filter {
             Scale          => D3D11_FILTER_MIN_MAG_MIP_POINT,
@@ -254,7 +260,7 @@ pub fn map_filter(filter: FilterMethod, op: FilterOp) -> D3D11_FILTER {
 }
 
 pub fn map_dsv_flags(dsf: DepthStencilFlags) -> D3D11_DSV_FLAG {
-    use gfx_core::tex as t;
+    use core::texture as t;
     let mut out = D3D11_DSV_FLAG(0);
     if dsf.contains(t::RO_DEPTH) {
         out = out | D3D11_DSV_READ_ONLY_DEPTH;

@@ -16,10 +16,11 @@
 //!
 //! See `Slice`-structure documentation for more information on this module.
 
-use gfx_core::handle;
-use gfx_core::{Primitive, Resources, VertexCount};
-use gfx_core::draw::InstanceOption;
-use gfx_core::factory::{Bind, BufferRole, Factory};
+use core::{handle, buffer};
+use core::{Primitive, Resources, VertexCount};
+use core::command::InstanceParams;
+use core::factory::Factory;
+use core::memory::Bind;
 use format::Format;
 use pso;
 
@@ -67,7 +68,7 @@ pub struct Slice<R: Resources> {
     /// base-vertex.
     pub base_vertex: VertexCount,
     /// Instancing configuration.
-    pub instances: InstanceOption,
+    pub instances: Option<InstanceParams>,
     /// Represents the type of index-buffer used. 
     pub buffer: IndexBuffer<R>,
 }
@@ -87,15 +88,33 @@ impl<R: Resources> Slice<R> {
     
     /// Calculates the number of primitives of the specified type in this `Slice`.
     pub fn get_prim_count(&self, prim: Primitive) -> u32 {
-        use gfx_core::Primitive::*;
+        use core::Primitive as p;
         let nv = (self.end - self.start) as u32;
         match prim {
-            PointList => nv,
-            LineList => nv / 2,
-            LineStrip => (nv-1),
-            TriangleList => nv / 3,
-            TriangleStrip => (nv-2) / 3,
+            p::PointList => nv,
+            p::LineList => nv / 2,
+            p::LineStrip => (nv-1),
+            p::TriangleList => nv / 3,
+            p::TriangleStrip => (nv-2) / 3,
+            p::LineListAdjacency => nv / 4,
+            p::LineStripAdjacency => (nv-3),
+            p::TriangleListAdjacency => nv / 6,
+            p::TriangleStripAdjacency => (nv-4) / 2,
+            p::PatchList(num) => nv / (num as u32),
         }
+    }
+
+    /// Divides one slice into two at an index.
+    ///
+    /// The first will contain the range in the index-buffer [self.start, mid) (excluding the index mid itself) and the
+    /// second will contain the range [mid, self.end).
+    pub fn split_at(&self, mid: VertexCount) -> (Self, Self) {
+        let mut first = self.clone();
+        let mut second = self.clone();
+        first.end = mid;
+        second.start = mid;
+
+        (first, second)
     }
 }
 
@@ -161,7 +180,7 @@ macro_rules! impl_index_buffer {
         
         impl<'s, R: Resources> IntoIndexBuffer<R> for &'s [$prim_ty] {
             fn into_index_buffer<F: Factory<R> + ?Sized>(self, factory: &mut F) -> IndexBuffer<R> {
-                factory.create_buffer_const(self, BufferRole::Index, Bind::empty())
+                factory.create_buffer_immutable(self, buffer::Role::Index, Bind::empty())
                        .unwrap()
                        .into_index_buffer(factory)
             }

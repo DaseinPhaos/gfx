@@ -13,54 +13,53 @@
 // limitations under the License.
 
 use std::{mem, ptr};
-use winapi;
-use gfx_core::tex;
-use gfx_core::factory::{MapAccess, Usage};
+use winapi::{self, UINT};
+use core::{self, texture as tex};
 use command;
 use {Buffer, Texture};
 
+fn copy_buffer(context: *mut winapi::ID3D11DeviceContext,
+               src: &Buffer, dst: &Buffer,
+               src_offset: UINT, dst_offset: UINT,
+               size: UINT) {
+    let src_resource = src.as_resource();
+    let dst_resource = dst.as_resource();
+    let src_box = winapi::D3D11_BOX {
+        left: src_offset,
+        right: src_offset + size,
+        top: 0,
+        bottom: 1,
+        front: 0,
+        back: 1,
+    };
+    unsafe {
+        (*context).CopySubresourceRegion(dst_resource, 0, dst_offset, 0, 0,
+                                         src_resource, 0, &src_box)
+    };
+}
 
 pub fn update_buffer(context: *mut winapi::ID3D11DeviceContext, buffer: &Buffer,
                      data: &[u8], offset_bytes: usize) {
     let dst_resource = (buffer.0).0 as *mut winapi::ID3D11Resource;
-    match buffer.1 {
-        Usage::Const | Usage::CpuOnly(MapAccess::Readable) => {
-            error!("Unable to update an immutable buffer {:?}", buffer);
-        },
-        Usage::GpuOnly => {
-            let dst_box = winapi::D3D11_BOX {
-                left:   offset_bytes as winapi::UINT,
-                top:    0,
-                front:  0,
-                right:  (offset_bytes + data.len()) as winapi::UINT,
-                bottom: 1,
-                back:   1,
-            };
-            let ptr = data.as_ptr() as *const _;
-            unsafe {
-                (*context).UpdateSubresource(dst_resource, 0, &dst_box, ptr, 0, 0)
-            };
-        },
-        Usage::Dynamic | Usage::CpuOnly(_) => {
-            let map_type = winapi::D3D11_MAP_WRITE_DISCARD;
-            let hr = unsafe {
-                let mut sub = mem::zeroed();
-                let hr = (*context).Map(dst_resource, 0, map_type, 0, &mut sub);
-                let dst = (sub.pData as *mut u8).offset(offset_bytes as isize);
-                ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
-                (*context).Unmap(dst_resource, 0);
-                hr
-            };
-            if !winapi::SUCCEEDED(hr) {
-                error!("Buffer {:?} failed to map, error {:x}", buffer, hr);
-            }
-        },
+
+    // DYNAMIC only
+    let map_type = winapi::D3D11_MAP_WRITE_DISCARD;
+    let hr = unsafe {
+        let mut sub = mem::zeroed();
+        let hr = (*context).Map(dst_resource, 0, map_type, 0, &mut sub);
+        let dst = (sub.pData as *mut u8).offset(offset_bytes as isize);
+        ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        (*context).Unmap(dst_resource, 0);
+        hr
+    };
+    if !winapi::SUCCEEDED(hr) {
+        error!("Buffer {:?} failed to map, error {:x}", buffer, hr);
     }
 }
 
 pub fn update_texture(context: *mut winapi::ID3D11DeviceContext, texture: &Texture, kind: tex::Kind,
                       face: Option<tex::CubeFace>, data: &[u8], image: &tex::RawImageInfo) {
-    use gfx_core::tex::CubeFace::*;
+    use core::texture::CubeFace::*;
     use winapi::UINT;
 
     let array_slice = match face {
@@ -74,41 +73,34 @@ pub fn update_texture(context: *mut winapi::ID3D11DeviceContext, texture: &Textu
     };
     let num_mipmap_levels = 1; //TODO
     let subres = array_slice * num_mipmap_levels + (image.mipmap as UINT);
-    let dst_resource = texture.to_resource();
+    let dst_resource = texture.as_resource();
+    let (width, height, _, _) = kind.get_level_dimensions(image.mipmap);
+    let stride = image.format.0.get_total_bits() as usize;
+    let row_pitch = width as usize * stride;
+    let depth_pitch = height as usize * row_pitch;
 
-    match texture.1 {
-        Usage::Const | Usage::CpuOnly(MapAccess::Readable) => {
-            error!("Unable to update an immutable texture {:?}", texture);
-        },
-        Usage::GpuOnly => {
-            let (width, height, _, _) = kind.get_level_dimensions(image.mipmap);
-            let stride = image.format.0.get_total_bits() as UINT;
-            let row_pitch = width as UINT * stride;
-            let depth_pitch = height as UINT * row_pitch;      
-            let dst_box = winapi::D3D11_BOX {
-                left:   image.xoffset as UINT,
-                top:    image.yoffset as UINT,
-                front:  image.zoffset as UINT,
-                right:  (image.xoffset + image.width) as UINT,
-                bottom: (image.yoffset + image.height) as UINT,
-                back:   (image.zoffset + image.depth) as UINT,
-            };
-            let ptr = data.as_ptr() as *const _;
-            unsafe {
-                //let subres = winapi::D3D11CalcSubresource(image.mipmap, array_slice, num_mipmap_levels);
-                (*context).UpdateSubresource(dst_resource, subres, &dst_box, ptr, row_pitch, depth_pitch)
-            };
-        },
-        Usage::Dynamic | Usage::CpuOnly(_) => unimplemented!(),
+    // DYNAMIC only
+    let offset_bytes = image.xoffset as usize +
+                       image.yoffset as usize * row_pitch +
+                       image.zoffset as usize * depth_pitch;
+    let map_type = winapi::D3D11_MAP_WRITE_DISCARD;
+    let hr = unsafe {
+        let mut sub = mem::zeroed();
+        let hr = (*context).Map(dst_resource, subres, map_type, 0, &mut sub);
+        let dst = (sub.pData as *mut u8).offset(offset_bytes as isize);
+        ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        (*context).Unmap(dst_resource, 0);
+        hr
+    };
+    if !winapi::SUCCEEDED(hr) {
+        error!("Texture {:?} failed to map, error {:x}", texture, hr);
     }
-    
 }
 
 
 pub fn process(ctx: *mut winapi::ID3D11DeviceContext, command: &command::Command, data_buf: &command::DataBuffer) {
     use winapi::UINT;
-    use gfx_core as core;
-    use gfx_core::shade::Stage;
+    use core::shade::Stage;
     use command::Command::*;
 
     let max_cb  = core::MAX_CONSTANT_BUFFERS as UINT;
@@ -118,6 +110,8 @@ pub fn process(ctx: *mut winapi::ID3D11DeviceContext, command: &command::Command
     match *command {
         BindProgram(ref prog) => unsafe {
             (*ctx).VSSetShader(prog.vs, ptr::null_mut(), 0);
+            (*ctx).HSSetShader(prog.hs, ptr::null_mut(), 0);
+            (*ctx).DSSetShader(prog.ds, ptr::null_mut(), 0);
             (*ctx).GSSetShader(prog.gs, ptr::null_mut(), 0);
             (*ctx).PSSetShader(prog.ps, ptr::null_mut(), 0);
         },
@@ -135,6 +129,12 @@ pub fn process(ctx: *mut winapi::ID3D11DeviceContext, command: &command::Command
             Stage::Vertex => unsafe {
                 (*ctx).VSSetConstantBuffers(0, max_cb, &buffers[0].0);
             },
+            Stage::Hull => unsafe {
+                (*ctx).HSSetConstantBuffers(0, max_cb, &buffers[0].0);
+            },
+            Stage::Domain => unsafe {
+                (*ctx).DSSetConstantBuffers(0, max_cb, &buffers[0].0);
+            },
             Stage::Geometry => unsafe {
                 (*ctx).GSSetConstantBuffers(0, max_cb, &buffers[0].0);
             },
@@ -146,6 +146,12 @@ pub fn process(ctx: *mut winapi::ID3D11DeviceContext, command: &command::Command
             Stage::Vertex => unsafe {
                 (*ctx).VSSetShaderResources(0, max_srv, &views[0].0);
             },
+            Stage::Hull => unsafe {
+                (*ctx).HSSetShaderResources(0, max_srv, &views[0].0);
+            },
+            Stage::Domain => unsafe {
+                (*ctx).DSSetShaderResources(0, max_srv, &views[0].0);
+            },
             Stage::Geometry => unsafe {
                 (*ctx).GSSetShaderResources(0, max_srv, &views[0].0);
             },
@@ -156,6 +162,12 @@ pub fn process(ctx: *mut winapi::ID3D11DeviceContext, command: &command::Command
         BindSamplers(stage, ref samplers) => match stage {
             Stage::Vertex => unsafe {
                 (*ctx).VSSetSamplers(0, max_sm, &samplers[0].0);
+            },
+            Stage::Hull => unsafe {
+                (*ctx).HSSetSamplers(0, max_sm, &samplers[0].0);
+            },
+            Stage::Domain => unsafe {
+                (*ctx).DSSetSamplers(0, max_sm, &samplers[0].0);
             },
             Stage::Geometry => unsafe {
                 (*ctx).GSSetSamplers(0, max_sm, &samplers[0].0);
@@ -185,6 +197,9 @@ pub fn process(ctx: *mut winapi::ID3D11DeviceContext, command: &command::Command
         },
         SetBlend(blend, ref value, mask) => unsafe {
             (*ctx).OMSetBlendState(blend as *mut _, value, mask);
+        },
+        CopyBuffer(ref src, ref dst, src_offset, dst_offset, size) => {
+            copy_buffer(ctx, src, dst, src_offset, dst_offset, size);
         },
         UpdateBuffer(ref buffer, pointer, offset) => {
             let data = data_buf.get(pointer);

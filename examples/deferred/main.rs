@@ -35,18 +35,23 @@ extern crate gfx_app;
 extern crate rand;
 extern crate genmesh;
 extern crate noise;
+extern crate winit;
 
 use rand::Rng;
 use cgmath::{SquareMatrix, Matrix4, Point3, Vector3, EuclideanVector, deg};
 use cgmath::{Transform, AffineMatrix3};
-pub use gfx::format::Depth;
 pub use gfx_app::ColorFormat;
-use gfx::Bundle;
+use gfx::{Bundle, texture};
 use genmesh::{Vertices, Triangulate};
 use genmesh::generators::{SharedVertex, IndexedPolygon};
-use std::time::{Instant};
-
 use noise::{Seed, perlin2};
+use std::time::{Instant};
+use winit::{Event, VirtualKeyCode, WindowBuilder};
+
+#[cfg(feature="metal")]
+pub use gfx::format::Depth32F as Depth;
+#[cfg(not(feature="metal"))]
+pub use gfx::format::Depth;
 
 // Remember to also change the constants in the shaders
 const NUM_LIGHTS: usize = 250;
@@ -68,8 +73,7 @@ gfx_defines!{
     }
 
     vertex BlitVertex {
-        pos: [i8; 2] = "a_Pos",
-        tex_coord: [i8; 2] = "a_TexCoord",
+        pos_tex: [i8; 4] = "a_PosTexCoord",
     }
 
     vertex CubeVertex {
@@ -77,7 +81,7 @@ gfx_defines!{
     }
 
     constant LightLocals {
-        cam_pos_and_radius: [f32; 4] = "u_CameraPosAndRadius",
+        cam_pos_and_radius: [f32; 4] = "u_CamPosAndRadius",
     }
 
     constant TerrainLocals {
@@ -95,7 +99,7 @@ gfx_defines!{
         vbuf: gfx::VertexBuffer<CubeVertex> = (),
         locals_vs: gfx::ConstantBuffer<CubeLocals> = "CubeLocals",
         locals_ps: gfx::ConstantBuffer<LightLocals> = "LightLocals",
-        light_pos_buf: gfx::ConstantBuffer<LightInfo> = "u_LightPosBlock",
+        light_pos_buf: gfx::ConstantBuffer<LightInfo> = "LightPosBlock",
         tex_pos: gfx::TextureSampler<[f32; 4]> = "t_Position",
         tex_normal: gfx::TextureSampler<[f32; 4]> = "t_Normal",
         tex_diffuse: gfx::TextureSampler<[f32; 4]> = "t_Diffuse",
@@ -126,7 +130,7 @@ gfx_defines!{
     pipeline emitter {
         vbuf: gfx::VertexBuffer<CubeVertex> = (),
         locals: gfx::ConstantBuffer<CubeLocals> = "CubeLocals",
-        light_pos_buf: gfx::ConstantBuffer<LightInfo> = "u_LightPosBlock",
+        light_pos_buf: gfx::ConstantBuffer<LightInfo> = "LightPosBlock",
         out_color: gfx::BlendTarget<GFormat> =
             ("Target0", gfx::state::MASK_ALL, gfx::preset::blend::ADD),
         out_depth: gfx::DepthTarget<Depth> =
@@ -155,7 +159,7 @@ fn calculate_color(height: f32) -> [f32; 3] {
     if height > 8.0 {
         [0.9, 0.9, 0.9] // white
     } else if height > 0.0 {
-        [0.7, 0.7, 0.7] // greay
+        [0.7, 0.7, 0.7] // grey
     } else if height > -5.0 {
         [0.2, 0.7, 0.2] // green
     } else {
@@ -171,7 +175,11 @@ struct ViewPair<R: gfx::Resources, T: gfx::format::Formatted> {
 // need a custom depth format in order to view SRV depth as float4
 struct DepthFormat;
 impl gfx::format::Formatted for DepthFormat {
+    #[cfg(feature="metal")]
+    type Surface = gfx::format::D32;
+    #[cfg(not(feature="metal"))]
     type Surface = gfx::format::D24;
+
     type Channel = gfx::format::Unorm;
     type View = [f32; 4];
 
@@ -182,7 +190,7 @@ impl gfx::format::Formatted for DepthFormat {
 }
 
 fn create_g_buffer<R: gfx::Resources, F: gfx::Factory<R>>(
-                   width: gfx::tex::Size, height: gfx::tex::Size, factory: &mut F)
+                   width: texture::Size, height: texture::Size, factory: &mut F)
                    -> (ViewPair<R, GFormat>, ViewPair<R, GFormat>, ViewPair<R, GFormat>,
                        gfx::handle::ShaderResourceView<R, [f32; 4]>, gfx::handle::DepthStencilView<R, Depth>)
 {
@@ -216,17 +224,19 @@ struct App<R: gfx::Resources> {
     intermediate: ViewPair<R, GFormat>,
     light_pos_vec: Vec<LightInfo>,
     seed: Seed,
+    depth_resource: gfx::handle::ShaderResourceView<R, [f32; 4]>,
     debug_buf: Option<gfx::handle::ShaderResourceView<R, [f32; 4]>>,
     start_time: Instant,
 }
 
 impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
-    fn new<F: gfx::Factory<R>>(mut factory: F, init: gfx_app::Init<R>) -> Self {
+    fn new<F: gfx::Factory<R>>(factory: &mut F, backend: gfx_app::shade::Backend,
+           window_targets: gfx_app::WindowTargets<R>) -> Self {
         use gfx::traits::FactoryExt;
 
-        let (width, height, _, _) = init.color.get_dimensions();
-        let (gpos, gnormal, gdiffuse, _depth_resource, depth_target) =
-            create_g_buffer(width, height, &mut factory);
+        let (width, height, _, _) = window_targets.color.get_dimensions();
+        let (gpos, gnormal, gdiffuse, depth_resource, depth_target) =
+            create_g_buffer(width, height, factory);
         let res = {
             let (_ , srv, rtv) = factory.create_render_target(width, height).unwrap();
             ViewPair{ resource: srv, target: rtv }
@@ -238,8 +248,8 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         };
 
         let sampler = factory.create_sampler(
-            gfx::tex::SamplerInfo::new(gfx::tex::FilterMethod::Scale,
-                                       gfx::tex::WrapMode::Clamp)
+            texture::SamplerInfo::new(texture::FilterMethod::Scale,
+                                       texture::WrapMode::Clamp)
         );
 
         let terrain = {
@@ -266,17 +276,19 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             let vs = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/terrain.glslv"),
                 hlsl_40:  include_bytes!("data/terrain_vs.fx"),
+                msl_11:   include_bytes!("shader/terrain_vertex.metal"),
                 .. gfx_app::shade::Source::empty()
             };
             let ps = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/terrain.glslf"),
                 hlsl_40:  include_bytes!("data/terrain_ps.fx"),
+                msl_11:   include_bytes!("shader/terrain_frag.metal"),
                 .. gfx_app::shade::Source::empty()
             };
 
             let pso = factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap(),
                 terrain::new()
                 ).unwrap();
 
@@ -294,9 +306,9 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
 
         let blit = {
             let vertex_data = [
-                BlitVertex { pos: [-3, -1], tex_coord: [-1, 0] },
-                BlitVertex { pos: [ 1, -1], tex_coord: [1, 0] },
-                BlitVertex { pos: [ 1,  3], tex_coord: [1, 2] },
+                BlitVertex { pos_tex: [-3, -1, -1, 0] },
+                BlitVertex { pos_tex: [ 1, -1,  1, 0] },
+                BlitVertex { pos_tex: [ 1,  3,  1, 2] },
             ];
 
             let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, ());
@@ -304,24 +316,26 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             let vs = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/blit.glslv"),
                 hlsl_40:  include_bytes!("data/blit_vs.fx"),
+                msl_11:   include_bytes!("shader/blit_vertex.metal"),
                 .. gfx_app::shade::Source::empty()
             };
             let ps = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/blit.glslf"),
                 hlsl_40:  include_bytes!("data/blit_ps.fx"),
+                msl_11:   include_bytes!("shader/blit_frag.metal"),
                 .. gfx_app::shade::Source::empty()
             };
 
             let pso = factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap(),
                 blit::new()
                 ).unwrap();
 
             let data = blit::Data {
                 vbuf: vbuf,
                 tex: (gpos.resource.clone(), sampler.clone()),
-                out: init.color,
+                out: window_targets.color,
             };
 
             Bundle::new(slice, pso, data)
@@ -380,17 +394,19 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             let vs = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/light.glslv"),
                 hlsl_40:  include_bytes!("data/light_vs.fx"),
+                msl_11:   include_bytes!("shader/light_vertex.metal"),
                 .. gfx_app::shade::Source::empty()
             };
             let ps = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/light.glslf"),
                 hlsl_40:  include_bytes!("data/light_ps.fx"),
+                msl_11:   include_bytes!("shader/light_frag.metal"),
                 .. gfx_app::shade::Source::empty()
             };
 
             let pso = factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap(),
                 light::new()
                 ).unwrap();
 
@@ -413,17 +429,19 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             let vs = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/emitter.glslv"),
                 hlsl_40:  include_bytes!("data/emitter_vs.fx"),
+                msl_11:   include_bytes!("shader/emitter_vertex.metal"),
                 .. gfx_app::shade::Source::empty()
             };
             let ps = gfx_app::shade::Source {
                 glsl_150: include_bytes!("shader/emitter.glslf"),
                 hlsl_40:  include_bytes!("data/emitter_ps.fx"),
+                msl_11:   include_bytes!("shader/emitter_frag.metal"),
                 .. gfx_app::shade::Source::empty()
             };
 
             let pso = factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap(),
                 emitter::new()
                 ).unwrap();
 
@@ -448,23 +466,11 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
                 LightInfo{ pos: [0.0, 0.0, 0.0, 0.0] }
             }).collect(),
             seed: seed,
+            depth_resource: depth_resource,
             debug_buf: None,
             start_time: Instant::now(),
         }
     }
-
-    /*fn update(&mut self) {
-        Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key1)) =>
-            debug_buf = Some(gpos.resource.clone()),
-        Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key2)) =>
-            debug_buf = Some(gnormal.resource.clone()),
-        Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key3)) =>
-            debug_buf = Some(gdiffuse.resource.clone()),
-        Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key4)) =>
-            debug_buf = Some(depth_resource.clone()),
-        Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key0)) =>
-            debug_buf = None,
-    }*/
 
     fn render<C: gfx::CommandBuffer<R>>(&mut self, encoder: &mut gfx::Encoder<R, C>) {
         let elapsed = self.start_time.elapsed();
@@ -545,9 +551,56 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         // Show the result
         self.blit.encode(encoder);
     }
+
+    fn on(&mut self, event: Event) {
+        match event {
+            Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key1)) =>
+                self.debug_buf = Some(self.light.data.tex_pos.0.clone()),
+            Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key2)) =>
+                self.debug_buf = Some(self.light.data.tex_normal.0.clone()),
+            Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key3)) =>
+                self.debug_buf = Some(self.light.data.tex_diffuse.0.clone()),
+            Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key4)) =>
+                self.debug_buf = Some(self.depth_resource.clone()),
+            Event::KeyboardInput(_, _, Some(VirtualKeyCode::Key0)) =>
+                self.debug_buf = None,
+            _ => (),
+        }
+    }
+
+    fn on_resize_ext<F: gfx::Factory<R>>(&mut self, factory: &mut F, window_targets: gfx_app::WindowTargets<R>) {
+        let (width, height, _, _) = window_targets.color.get_dimensions();
+
+        let (gpos, gnormal, gdiffuse, depth_resource, depth_target) =
+            create_g_buffer(width, height, factory);
+        self.intermediate = {
+            let (_ , srv, rtv) = factory.create_render_target(width, height).unwrap();
+            ViewPair{ resource: srv, target: rtv }
+        };
+
+        self.terrain.data.out_position = gpos.target.clone();
+        self.terrain.data.out_normal = gnormal.target.clone();
+        self.terrain.data.out_color = gdiffuse.target.clone();
+        self.terrain.data.out_depth = depth_target.clone();
+
+        self.blit.data.out = window_targets.color;
+        self.blit.data.tex.0 = gpos.resource.clone();
+
+        self.light.data.tex_pos.0 = gpos.resource.clone();
+        self.light.data.tex_normal.0 = gnormal.resource.clone();
+        self.light.data.tex_diffuse.0 = gdiffuse.resource.clone();
+        self.light.data.out_color = self.intermediate.target.clone();
+        self.light.data.out_depth = depth_target.clone();
+
+        self.emitter.data.out_color = self.intermediate.target.clone();
+        self.emitter.data.out_depth = depth_target.clone();
+
+        self.depth_resource = depth_resource;
+    }
 }
 
 pub fn main() {
     use gfx_app::Application;
-    App::launch_default("Deferred rendering example with gfx-rs");
+    let wb = WindowBuilder::new().with_title("Deferred rendering example with gfx-rs");
+    App::launch_default(wb);
 }

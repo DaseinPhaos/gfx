@@ -14,13 +14,14 @@
 
 [package]
 name = "gfx"
-version = "0.12.0"
+version = "0.14.0"
 description = "A high-performance, bindless graphics API"
 homepage = "https://github.com/gfx-rs/gfx"
 repository = "https://github.com/gfx-rs/gfx"
 keywords = ["graphics", "gamedev"]
 license = "Apache-2.0"
 authors = ["The Gfx-rs Developers"]
+categories = ["rendering::graphics-api"]
 
 [lib]
 name = "gfx"
@@ -32,4 +33,4 @@ unstable = []
 [dependencies]
 draw_state = "0.6"
 log = "0.3"
-gfx_core = { path = "../core", version = "0.4" }
+gfx_core = { path = "../core", version = "0.6" }

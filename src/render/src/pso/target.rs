@@ -15,41 +15,49 @@
 //! Render target components for a PSO.
 
 use std::marker::PhantomData;
-use gfx_core::{ColorSlot, Resources};
-use gfx_core::{format, handle, pso, state, target};
-use gfx_core::factory::Typed;
-use gfx_core::shade::OutputVar;
-use super::{DataLink, DataBind, RawDataSet};
+use core::{ColorSlot, Resources};
+use core::{format, handle, pso, state, target};
+use core::memory::Typed;
+use core::shade::OutputVar;
+use super::{DataLink, DataBind, RawDataSet, AccessInfo};
 
 /// Render target component. Typically points to a color-formatted texture.
+///
 /// - init: `&str` = name of the target
 /// - data: `RenderTargetView<T>`
 pub struct RenderTarget<T>(Option<ColorSlot>, PhantomData<T>);
 /// Render target component with active blending mode.
+///
 /// - init: (`&str`, `ColorMask`, `Blend` = blending state)
 /// - data: `RenderTargetView<T>`
 pub struct BlendTarget<T>(RawRenderTarget, PhantomData<T>);
 /// Raw (untyped) render target component with optional blending.
+///
 /// - init: (`&str`, `Format`, `ColorMask`, `Option<Blend>`)
 /// - data: `RawRenderTargetView`
 pub struct RawRenderTarget(Option<ColorSlot>);
 /// Depth target component.
+///
 /// - init: `Depth` = depth state
 /// - data: `DepthStencilView<T>`
 pub struct DepthTarget<T>(PhantomData<T>);
 /// Stencil target component.
+///
 /// - init: `Stencil` = stencil state
 /// - data: (`DepthStencilView<T>`, `(front, back)` = stencil reference values)
 pub struct StencilTarget<T>(PhantomData<T>);
 /// Depth + stencil target component.
+///
 /// - init: (`Depth` = depth state, `Stencil` = stencil state)
 /// - data: (`DepthStencilView<T>`, `(front, back)` = stencil reference values)
 pub struct DepthStencilTarget<T>(PhantomData<T>);
 /// Scissor component. Sets up the scissor test for rendering.
+///
 /// - init: `()`
 /// - data: `Rect` = target area
 pub struct Scissor(bool);
 /// Blend reference component. Sets up the reference color for blending.
+///
 /// - init: `()`
 /// - data: `ColorValue`
 pub struct BlendRef;
@@ -77,7 +85,11 @@ impl<'a, T: format::RenderFormat> DataLink<'a> for RenderTarget<T> {
 
 impl<R: Resources, T> DataBind<R> for RenderTarget<T> {
     type Data = handle::RenderTargetView<R, T>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         if let Some(slot) = self.0 {
             out.pixel_targets.add_color(slot, man.ref_rtv(data.raw()), data.raw().get_dimensions());
         }
@@ -101,8 +113,12 @@ impl<'a, T: format::BlendFormat> DataLink<'a> for BlendTarget<T> {
 
 impl<R: Resources, T> DataBind<R> for BlendTarget<T> {
     type Data = handle::RenderTargetView<R, T>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
-        self.0.bind_to(out, data.raw(), man)
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               access: &mut AccessInfo<R>) {
+        self.0.bind_to(out, data.raw(), man, access)
     }
 }
 
@@ -132,7 +148,11 @@ impl<'a> DataLink<'a> for RawRenderTarget {
 
 impl<R: Resources> DataBind<R> for RawRenderTarget {
     type Data = handle::RawRenderTargetView<R>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         if let Some(slot) = self.0 {
             out.pixel_targets.add_color(slot, man.ref_rtv(data), data.get_dimensions());
         }
@@ -145,13 +165,17 @@ impl<'a, T: format::DepthFormat> DataLink<'a> for DepthTarget<T> {
     fn new() -> Self { DepthTarget(PhantomData) }
     fn is_active(&self) -> bool { true }
     fn link_depth_stencil(&mut self, init: &Self::Init) -> Option<pso::DepthStencilDesc> {
-        Some((T::get_format().0, (*init).into()))
+        Some((T::get_format(), (*init).into()))
     }
 }
 
 impl<R: Resources, T> DataBind<R> for DepthTarget<T> {
     type Data = handle::DepthStencilView<R, T>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         let dsv = data.raw();
         out.pixel_targets.add_depth_stencil(man.ref_dsv(dsv), true, false, dsv.get_dimensions());
     }
@@ -162,13 +186,17 @@ impl<'a, T: format::StencilFormat> DataLink<'a> for StencilTarget<T> {
     fn new() -> Self { StencilTarget(PhantomData) }
     fn is_active(&self) -> bool { true }
     fn link_depth_stencil(&mut self, init: &Self::Init) -> Option<pso::DepthStencilDesc> {
-        Some((T::get_format().0, (*init).into()))
+        Some((T::get_format(), (*init).into()))
     }
 }
 
 impl<R: Resources, T> DataBind<R> for StencilTarget<T> {
     type Data = (handle::DepthStencilView<R, T>, (target::Stencil, target::Stencil));
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         let dsv = data.0.raw();
         out.pixel_targets.add_depth_stencil(man.ref_dsv(dsv), false, true, dsv.get_dimensions());
         out.ref_values.stencil = data.1;
@@ -180,13 +208,17 @@ impl<'a, T: format::DepthStencilFormat> DataLink<'a> for DepthStencilTarget<T> {
     fn new() -> Self { DepthStencilTarget(PhantomData) }
     fn is_active(&self) -> bool { true }
     fn link_depth_stencil(&mut self, init: &Self::Init) -> Option<pso::DepthStencilDesc> {
-        Some((T::get_format().0, (*init).into()))
+        Some((T::get_format(), (*init).into()))
     }
 }
 
 impl<R: Resources, T> DataBind<R> for DepthStencilTarget<T> {
     type Data = (handle::DepthStencilView<R, T>, (target::Stencil, target::Stencil));
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         let dsv = data.0.raw();
         out.pixel_targets.add_depth_stencil(man.ref_dsv(dsv), true, true, dsv.get_dimensions());
         out.ref_values.stencil = data.1;
@@ -203,7 +235,11 @@ impl<'a> DataLink<'a> for Scissor {
 
 impl<R: Resources> DataBind<R> for Scissor {
     type Data = target::Rect;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, _: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               _: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         out.scissor = *data;
     }
 }
@@ -216,7 +252,11 @@ impl<'a> DataLink<'a> for BlendRef {
 
 impl<R: Resources> DataBind<R> for BlendRef {
     type Data = target::ColorValue;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, _: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               _: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         out.ref_values.blend = *data;
     }
 }

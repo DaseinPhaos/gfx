@@ -15,9 +15,9 @@
 //! Dummy backend implementation to test the code for compile errors
 //! outside of the graphics development environment.
 
-use {Capabilities, Device, Resources, IndexType, VertexCount};
-use {draw, handle, pso, shade, target, tex};
-use state as s;
+use {Capabilities, Device, SubmissionResult, Resources, IndexType, VertexCount};
+use {state, target, handle, mapping, pso, shade, texture};
+use command::{self, AccessInfo};
 
 /// Dummy device which does minimal work, just to allow testing
 /// gfx-rs apps for compilation.
@@ -40,7 +40,22 @@ impl Resources for DummyResources {
     type RenderTargetView     = ();
     type DepthStencilView     = ();
     type Sampler              = ();
-    type Fence                = ();
+    type Fence                = DummyFence;
+    type Mapping              = DummyMapping;
+}
+
+/// Dummy fence that does nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DummyFence;
+
+/// Dummy mapping which will crash on use.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DummyMapping;
+
+impl mapping::Gate<DummyResources> for DummyMapping {
+    unsafe fn set<T>(&self, _index: usize, _val: T) { unimplemented!() }
+    unsafe fn slice<'a, 'b, T>(&'a self, _len: usize) -> &'b [T] { unimplemented!() }
+    unsafe fn mut_slice<'a, 'b, T>(&'a self, _len: usize) -> &'b mut [T] { unimplemented!() }
 }
 
 impl DummyDevice {
@@ -50,6 +65,7 @@ impl DummyDevice {
             max_vertex_count: 0,
             max_index_count: 0,
             max_texture_size: 0,
+            max_patch_size: 0,
             instance_base_supported: false,
             instance_call_supported: false,
             instance_rate_supported: false,
@@ -58,6 +74,7 @@ impl DummyDevice {
             constant_buffer_supported: false,
             unordered_access_view_supported: false,
             separate_blending_slots_supported: false,
+            copy_buffer_supported: false,
         };
         DummyDevice {
             capabilities: caps,
@@ -67,8 +84,7 @@ impl DummyDevice {
 
 /// Dummy command buffer, which ignores all the calls.
 pub struct DummyCommandBuffer;
-impl draw::CommandBuffer<DummyResources> for DummyCommandBuffer {
-    fn clone_empty(&self) -> DummyCommandBuffer { DummyCommandBuffer }
+impl command::Buffer<DummyResources> for DummyCommandBuffer {
     fn reset(&mut self) {}
     fn bind_pipeline_state(&mut self, _: ()) {}
     fn bind_vertex_buffers(&mut self, _: pso::VertexBufferSet<DummyResources>) {}
@@ -80,17 +96,20 @@ impl draw::CommandBuffer<DummyResources> for DummyCommandBuffer {
     fn bind_pixel_targets(&mut self, _: pso::PixelTargetSet<DummyResources>) {}
     fn bind_index(&mut self, _: (), _: IndexType) {}
     fn set_scissor(&mut self, _: target::Rect) {}
-    fn set_ref_values(&mut self, _: s::RefValues) {}
+    fn set_ref_values(&mut self, _: state::RefValues) {}
+    fn copy_buffer(&mut self, _: (), _: (),
+                   _: usize, _: usize,
+                   _: usize) {}
     fn update_buffer(&mut self, _: (), _: &[u8], _: usize) {}
-    fn update_texture(&mut self, _: (), _: tex::Kind, _: Option<tex::CubeFace>,
-                      _: &[u8], _: tex::RawImageInfo) {}
+    fn update_texture(&mut self, _: (), _: texture::Kind, _: Option<texture::CubeFace>,
+                      _: &[u8], _: texture::RawImageInfo) {}
     fn generate_mipmap(&mut self, _: ()) {}
-    fn clear_color(&mut self, _: (), _: draw::ClearColor) {}
+    fn clear_color(&mut self, _: (), _: command::ClearColor) {}
     fn clear_depth_stencil(&mut self, _: (), _: Option<target::Depth>,
                            _: Option<target::Stencil>) {}
-    fn call_draw(&mut self, _: VertexCount, _: VertexCount, _: draw::InstanceOption) {}
+    fn call_draw(&mut self, _: VertexCount, _: VertexCount, _: Option<command::InstanceParams>) {}
     fn call_draw_indexed(&mut self, _: VertexCount, _: VertexCount,
-                         _: VertexCount, _: draw::InstanceOption) {}
+                         _: VertexCount, _: Option<command::InstanceParams>) {}
 }
 
 impl Device for DummyDevice {
@@ -101,6 +120,24 @@ impl Device for DummyDevice {
         &self.capabilities
     }
     fn pin_submitted_resources(&mut self, _: &handle::Manager<DummyResources>) {}
-    fn submit(&mut self, _: &mut DummyCommandBuffer) {}
+    fn submit(&mut self,
+              _: &mut DummyCommandBuffer,
+              _: &AccessInfo<Self::Resources>)
+              -> SubmissionResult<()> {
+        unimplemented!()
+    }
+
+    fn fenced_submit(&mut self,
+                     _: &mut Self::CommandBuffer,
+                     _: &AccessInfo<Self::Resources>,
+                     _after: Option<handle::Fence<Self::Resources>>)
+                     -> SubmissionResult<handle::Fence<Self::Resources>> {
+        unimplemented!()
+    }
+
+    fn wait_fence(&mut self, _: &handle::Fence<Self::Resources>) {
+        unimplemented!()
+    }
+
     fn cleanup(&mut self) {}
 }

@@ -18,160 +18,12 @@
 //! includes several items to facilitate this. 
 
 use std::error::Error;
-use std::fmt;
-use std::mem;
-use {handle, format, mapping, pso, shade, target, tex};
-use {Capabilities, Resources, Pod};
-use {VertexShader, GeometryShader, PixelShader, ShaderSet};
-
-
-/// A service trait used to get the raw data out of
-/// strong types. Not meant for public use.
-pub trait Typed: Sized {
-    /// The raw type behind the phantom.
-    type Raw;
-    /// Crete a new phantom from the raw type.
-    fn new(raw: Self::Raw) -> Self;
-    /// Get an internal reference to the raw type.
-    fn raw(&self) -> &Self::Raw;
-}
-
-
-/// Cast a slice from one POD type to another.
-pub fn cast_slice<A: Pod, B: Pod>(slice: &[A]) -> &[B] {
-    use std::slice;
-    let raw_len = mem::size_of::<A>().wrapping_mul(slice.len());
-    let len = raw_len / mem::size_of::<B>();
-    assert_eq!(raw_len, mem::size_of::<B>().wrapping_mul(len));
-    unsafe {
-        slice::from_raw_parts(slice.as_ptr() as *const B, len)
-    }
-}
-
-/// Specifies the access allowed to a buffer mapping.
-#[derive(Eq, Ord, PartialEq, PartialOrd, Hash, Copy, Clone, Debug)]
-#[repr(u8)]
-pub enum MapAccess {
-    /// Only allow reads.
-    Readable,
-    /// Only allow writes.
-    Writable,
-    /// Allow full access.
-    RW
-}
-
-bitflags!(
-    /// Bind flags
-    pub flags Bind: u8 {
-        /// The resource can be rendered into.
-        const RENDER_TARGET    = 0x1,
-        /// The resource can serve as a depth/stencil target.
-        const DEPTH_STENCIL    = 0x2,
-        /// The resource can be bound to the shader for reading.
-        const SHADER_RESOURCE  = 0x4,
-        /// The resource can be bound to the shader for writing.
-        const UNORDERED_ACCESS = 0x8,
-    }
-);
-
-
-/// Role of the memory buffer. GLES doesn't allow chaning bind points for buffers.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-#[repr(u8)]
-pub enum BufferRole {
-    /// Generic vertex buffer
-    Vertex,
-    /// Index buffer
-    Index,
-    /// Uniform block buffer //TODO: rename to `Constant`
-    Uniform,
-}
-
-/// A hint as to how this buffer/texture will be used.
-///
-/// The nature of these hints make them very implementation specific. Different drivers on
-/// different hardware will handle them differently. Only careful profiling will tell which is the
-/// best to use for a specific buffer.
-#[derive(Eq, Ord, PartialEq, PartialOrd, Hash, Copy, Clone, Debug)]
-#[repr(u8)]
-pub enum Usage {
-    /// GPU: read + write, CPU: copy. Optimal for render targets.
-    GpuOnly,
-    /// GPU: read, CPU: none. Optimal for resourced textures/buffers.
-    Const,
-    /// GPU: read, CPU: write.
-    Dynamic,
-    /// GPU: copy, CPU: as specified. Used as a staging buffer,
-    /// to be copied back and forth with on-GPU targets.
-    CpuOnly(MapAccess),
-}
-
-/// An information block that is immutable and associated with each buffer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BufferInfo {
-    /// Role
-    pub role: BufferRole,
-    /// Usage hint
-    pub usage: Usage,
-    /// Bind flags
-    pub bind: Bind,
-    /// Size in bytes
-    pub size: usize,
-    /// Stride of a single element, in bytes. Only used for structured buffers
-    /// that you use via shader resource / unordered access views.
-    pub stride: usize,
-}
-
-/// Error creating a buffer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BufferError {
-    /// Some of the bind flags are not supported.
-    UnsupportedBind(Bind),
-    /// Unknown other error.
-    Other,
-    //todo: unsupported role
-}
-
-impl fmt::Display for BufferError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let BufferError::UnsupportedBind(ref bind) = *self {
-            write!(f, "{}: {:?}", self.description(), bind)
-        } else {
-            write!(f, "{}", self.description())
-        }
-    }
-}
-
-impl Error for BufferError {
-    fn description(&self) -> &str {
-        match *self {
-            BufferError::UnsupportedBind(_) => "Bind flags are not supported",
-            BufferError::Other => "An unknown error occurred",
-        }
-    }
-}
-
-/// An error happening on buffer updates.
-#[derive(Clone, PartialEq, Debug)]
-pub enum BufferUpdateError {
-    /// Trying to change the contents outside of the allocation.
-    OutOfBounds,
-}
-
-impl fmt::Display for BufferUpdateError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.description())
-    }
-}
-
-impl Error for BufferUpdateError {
-    fn description(&self) -> &str {
-        match *self {
-            BufferUpdateError::OutOfBounds =>
-                "Tried to change the buffer contents outside of the allocation",
-        }
-    }
-}
+use std::{mem, fmt};
+use {buffer, handle, format, mapping, pso, shade, target, texture};
+use {Capabilities, Resources, ShaderSet,
+     VertexShader, HullShader, DomainShader, GeometryShader, PixelShader};
+use memory::{Usage, Typed, Pod, cast_slice};
+use memory::{Bind, RENDER_TARGET, DEPTH_STENCIL, SHADER_RESOURCE, UNORDERED_ACCESS};
 
 /// Error creating either a ShaderResourceView, or UnorderedAccessView.
 #[derive(Clone, PartialEq, Debug)]
@@ -180,16 +32,18 @@ pub enum ResourceViewError {
     NoBindFlag,
     /// Selected channel type is not supported for this texture.
     Channel(format::ChannelType),
+    /// Selected layer can not be viewed for this texture.
+    Layer(texture::LayerError),
     /// The backend was refused for some reason.
     Unsupported,
 }
 
 impl fmt::Display for ResourceViewError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let ResourceViewError::Channel(ref channel_type) = *self {
-            write!(f, "{}: {:?}", self.description(), channel_type)
-        } else {
-            write!(f, "{}", self.description())
+        match *self {
+            ResourceViewError::Channel(ref channel_type) => write!(f, "{}: {:?}", self.description(), channel_type),
+            ResourceViewError::Layer(ref le) => write!(f, "{}: {}", self.description(), le),
+            _ => write!(f, "{}", self.description())
         }
     }
 }
@@ -199,7 +53,16 @@ impl Error for ResourceViewError {
         match *self {
             ResourceViewError::NoBindFlag => "The corresponding bind flag is not present in the texture",
             ResourceViewError::Channel(_) => "Selected channel type is not supported for this texture",
+            ResourceViewError::Layer(_) => "Selected layer can not be viewed for this texture",
             ResourceViewError::Unsupported => "The backend was refused for some reason",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        if let ResourceViewError::Layer(ref e) = *self {
+            Some(e)
+        } else {
+            None
         }
     }
 }
@@ -210,21 +73,23 @@ pub enum TargetViewError {
     /// The `RENDER_TARGET`/`DEPTH_STENCIL` flag is not present in the texture.
     NoBindFlag,
     /// Selected mip level doesn't exist.
-    BadLevel(target::Level),
+    Level(target::Level),
     /// Selected array layer doesn't exist.
-    BadLayer(target::Layer),
+    Layer(texture::LayerError),
     /// Selected channel type is not supported for this texture.
     Channel(format::ChannelType),
     /// The backend was refused for some reason.
     Unsupported,
+    /// The RTV cannot be changed due to the references to it existing.
+    NotDetached
 }
 
 impl fmt::Display for TargetViewError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let description = self.description();
         match *self {
-            TargetViewError::BadLevel(ref level) => write!(f, "{}: {}", description, level),
-            TargetViewError::BadLayer(ref layer) => write!(f, "{}: {}", description, layer),
+            TargetViewError::Level(ref level) => write!(f, "{}: {}", description, level),
+            TargetViewError::Layer(ref layer) => write!(f, "{}: {}", description, layer),
             TargetViewError::Channel(ref channel)  => write!(f, "{}: {:?}", description, channel),
             _ => write!(f, "{}", description)
         }
@@ -236,14 +101,24 @@ impl Error for TargetViewError {
         match *self {
             TargetViewError::NoBindFlag =>
                 "The `RENDER_TARGET`/`DEPTH_STENCIL` flag is not present in the texture",
-            TargetViewError::BadLevel(_) =>
+            TargetViewError::Level(_) =>
                 "Selected mip level doesn't exist",
-            TargetViewError::BadLayer(_) =>
+            TargetViewError::Layer(_) =>
                 "Selected array layer doesn't exist",
             TargetViewError::Channel(_) =>
                 "Selected channel type is not supported for this texture",
             TargetViewError::Unsupported =>
                 "The backend was refused for some reason",
+            TargetViewError::NotDetached =>
+                "The RTV cannot be changed due to the references to it existing",    
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        if let TargetViewError::Layer(ref e) = *self {
+            Some(e)
+        } else {
+            None
         }
     }
 }
@@ -252,7 +127,7 @@ impl Error for TargetViewError {
 #[derive(Clone, PartialEq, Debug)]
 pub enum CombinedError {
     /// Failed to create the raw texture.
-    Texture(tex::Error),
+    Texture(texture::CreationError),
     /// Failed to create SRV or UAV.
     Resource(ResourceViewError),
     /// Failed to create RTV or DSV.
@@ -287,8 +162,8 @@ impl Error for CombinedError {
     }
 }
 
-impl From<tex::Error> for CombinedError {
-    fn from(e: tex::Error) -> CombinedError {
+impl From<texture::CreationError> for CombinedError {
+    fn from(e: texture::CreationError) -> CombinedError {
         CombinedError::Texture(e)
     }
 }
@@ -316,39 +191,25 @@ impl From<TargetViewError> for CombinedError {
 /// Also see the `FactoryExt` trait inside the `gfx` module for additional methods.
 #[allow(missing_docs)]
 pub trait Factory<R: Resources> {
-    /// Associated mapper type
-    type Mapper: Clone + mapping::Raw;
-
     /// Returns the capabilities of this `Factory`. This usually depends on the graphics API being
     /// used.
     fn get_capabilities(&self) -> &Capabilities;
 
     // resource creation
-    fn create_buffer_raw(&mut self, BufferInfo) -> Result<handle::RawBuffer<R>, BufferError>;
-    fn create_buffer_const_raw(&mut self, data: &[u8], stride: usize, BufferRole, Bind)
-                                -> Result<handle::RawBuffer<R>, BufferError>;
-    fn create_buffer_const<T: Pod>(&mut self, data: &[T], role: BufferRole, bind: Bind) -> Result<handle::Buffer<R, T>, BufferError> {
-        self.create_buffer_const_raw(cast_slice(data), mem::size_of::<T>(), role, bind)
+    fn create_buffer_raw(&mut self, buffer::Info) -> Result<handle::RawBuffer<R>, buffer::CreationError>;
+    fn create_buffer_immutable_raw(&mut self, data: &[u8], stride: usize, buffer::Role, Bind)
+                                   -> Result<handle::RawBuffer<R>, buffer::CreationError>;
+    fn create_buffer_immutable<T: Pod>(&mut self, data: &[T], role: buffer::Role, bind: Bind)
+                                       -> Result<handle::Buffer<R, T>, buffer::CreationError> {
+        self.create_buffer_immutable_raw(cast_slice(data), mem::size_of::<T>(), role, bind)
             .map(|raw| Typed::new(raw))
     }
-    fn create_buffer_dynamic<T>(&mut self, num: usize, role: BufferRole, bind: Bind)
-                                -> Result<handle::Buffer<R, T>, BufferError> {
+    fn create_buffer<T>(&mut self, num: usize, role: buffer::Role, usage: Usage, bind: Bind)
+                        -> Result<handle::Buffer<R, T>, buffer::CreationError> {
         let stride = mem::size_of::<T>();
-        let info = BufferInfo {
+        let info = buffer::Info {
             role: role,
-            usage: Usage::Dynamic,
-            bind: bind,
-            size: num * stride,
-            stride: stride,
-        };
-        self.create_buffer_raw(info).map(|raw| Typed::new(raw))
-    }
-    fn create_buffer_staging<T>(&mut self, num: usize, role: BufferRole, bind: Bind, map: MapAccess)
-                             -> Result<handle::Buffer<R, T>, BufferError> {
-        let stride = mem::size_of::<T>();
-        let info = BufferInfo {
-            role: role,
-            usage: Usage::CpuOnly(map),
+            usage: usage,
             bind: bind,
             size: num * stride,
             stride: stride,
@@ -373,6 +234,14 @@ pub trait Factory<R: Resources> {
     fn create_shader_vertex(&mut self, code: &[u8]) -> Result<VertexShader<R>, shade::CreateShaderError> {
         self.create_shader(shade::Stage::Vertex, code).map(|s| VertexShader(s))
     }
+    /// Compiles a `HullShader` from source.
+    fn create_shader_hull(&mut self, code: &[u8]) -> Result<HullShader<R>, shade::CreateShaderError> {
+        self.create_shader(shade::Stage::Hull, code).map(|s| HullShader(s))
+    }
+    /// Compiles a `VertexShader` from source.
+    fn create_shader_domain(&mut self, code: &[u8]) -> Result<DomainShader<R>, shade::CreateShaderError> {
+        self.create_shader(shade::Stage::Domain, code).map(|s| DomainShader(s))
+    }
     /// Compiles a `GeometryShader` from source.
     fn create_shader_geometry(&mut self, code: &[u8]) -> Result<GeometryShader<R>, shade::CreateShaderError> {
         self.create_shader(shade::Stage::Geometry, code).map(|s| GeometryShader(s))
@@ -383,43 +252,54 @@ pub trait Factory<R: Resources> {
         self.create_shader(shade::Stage::Pixel, code).map(|s| PixelShader(s))
     }
 
-    fn create_sampler(&mut self, tex::SamplerInfo) -> handle::Sampler<R>;
+    fn create_sampler(&mut self, texture::SamplerInfo) -> handle::Sampler<R>;
 
-    fn map_buffer_raw(&mut self, &handle::RawBuffer<R>, MapAccess) -> Self::Mapper;
-    fn unmap_buffer_raw(&mut self, Self::Mapper);
-    fn map_buffer_readable<T: Copy>(&mut self, &handle::Buffer<R, T>) -> mapping::Readable<T, R, Self> where
-        Self: Sized;
-    fn map_buffer_writable<T: Copy>(&mut self, &handle::Buffer<R, T>) -> mapping::Writable<T, R, Self> where
-        Self: Sized;
-    fn map_buffer_rw<T: Copy>(&mut self, &handle::Buffer<R, T>) -> mapping::RW<T, R, Self> where
-        Self: Sized;
+    /// Acquire a mapping Reader
+    ///
+    /// See `write_mapping` for more information.
+    fn read_mapping<'a, 'b, T>(&'a mut self, buf: &'b handle::Buffer<R, T>)
+                               -> Result<mapping::Reader<'b, R, T>,
+                                         mapping::Error>
+        where T: Copy;
+
+    /// Acquire a mapping Writer
+    ///
+    /// While holding this writer, you hold CPU-side exclusive access.
+    /// Any access overlap will result in an error.
+    /// Submitting commands involving this buffer to the device
+    /// implicitly requires exclusive access. Additionally,
+    /// further access will be stalled until execution completion.
+    fn write_mapping<'a, 'b, T>(&'a mut self, buf: &'b handle::Buffer<R, T>)
+                                -> Result<mapping::Writer<'b, R, T>,
+                                          mapping::Error>
+        where T: Copy;
 
     /// Create a new empty raw texture with no data. The channel type parameter is a hint,
     /// required to assist backends that have no concept of typeless formats (OpenGL).
     /// The initial data, if given, has to be provided for all mip levels and slices:
     /// Slice0.Mip0, Slice0.Mip1, ..., Slice1.Mip0, ...
-    fn create_texture_raw(&mut self, tex::Descriptor, Option<format::ChannelType>, Option<&[&[u8]]>)
-                          -> Result<handle::RawTexture<R>, tex::Error>;
+    fn create_texture_raw(&mut self, texture::Info, Option<format::ChannelType>, Option<&[&[u8]]>)
+                          -> Result<handle::RawTexture<R>, texture::CreationError>;
 
     fn view_buffer_as_shader_resource_raw(&mut self, &handle::RawBuffer<R>)
         -> Result<handle::RawShaderResourceView<R>, ResourceViewError>;
     fn view_buffer_as_unordered_access_raw(&mut self, &handle::RawBuffer<R>)
         -> Result<handle::RawUnorderedAccessView<R>, ResourceViewError>;
-    fn view_texture_as_shader_resource_raw(&mut self, &handle::RawTexture<R>, tex::ResourceDesc)
+    fn view_texture_as_shader_resource_raw(&mut self, &handle::RawTexture<R>, texture::ResourceDesc)
         -> Result<handle::RawShaderResourceView<R>, ResourceViewError>;
     fn view_texture_as_unordered_access_raw(&mut self, &handle::RawTexture<R>)
         -> Result<handle::RawUnorderedAccessView<R>, ResourceViewError>;
-    fn view_texture_as_render_target_raw(&mut self, &handle::RawTexture<R>, tex::RenderDesc)
+    fn view_texture_as_render_target_raw(&mut self, &handle::RawTexture<R>, texture::RenderDesc)
         -> Result<handle::RawRenderTargetView<R>, TargetViewError>;
-    fn view_texture_as_depth_stencil_raw(&mut self, &handle::RawTexture<R>, tex::DepthStencilDesc)
+    fn view_texture_as_depth_stencil_raw(&mut self, &handle::RawTexture<R>, texture::DepthStencilDesc)
         -> Result<handle::RawDepthStencilView<R>, TargetViewError>;
 
-    fn create_texture<S>(&mut self, kind: tex::Kind, levels: target::Level,
+    fn create_texture<S>(&mut self, kind: texture::Kind, levels: target::Level,
                       bind: Bind, usage: Usage, channel_hint: Option<format::ChannelType>)
-                      -> Result<handle::Texture<R, S>, tex::Error>
+                      -> Result<handle::Texture<R, S>, texture::CreationError>
     where S: format::SurfaceTyped
     {
-        let desc = tex::Descriptor {
+        let desc = texture::Info {
             kind: kind,
             levels: levels,
             format: S::get_surface_type(),
@@ -452,8 +332,9 @@ pub trait Factory<R: Resources> {
             return Err(ResourceViewError::NoBindFlag)
         }
         assert!(levels.0 <= levels.1);
-        let desc = tex::ResourceDesc {
+        let desc = texture::ResourceDesc {
             channel: <T::Channel as format::ChannelTyped>::get_channel_type(),
+            layer: None,
             min: levels.0,
             max: levels.1,
             swizzle: swizzle,
@@ -479,7 +360,7 @@ pub trait Factory<R: Resources> {
         if !tex.get_info().bind.contains(RENDER_TARGET) {
             return Err(TargetViewError::NoBindFlag)
         }
-        let desc = tex::RenderDesc {
+        let desc = texture::RenderDesc {
             channel: <T::Channel as format::ChannelTyped>::get_channel_type(),
             level: level,
             layer: layer,
@@ -489,13 +370,13 @@ pub trait Factory<R: Resources> {
     }
 
     fn view_texture_as_depth_stencil<T: format::DepthFormat>(&mut self, tex: &handle::Texture<R, T::Surface>,
-                                     level: target::Level, layer: Option<target::Layer>, flags: tex::DepthStencilFlags)
+                                     level: target::Level, layer: Option<target::Layer>, flags: texture::DepthStencilFlags)
                                      -> Result<handle::DepthStencilView<R, T>, TargetViewError>
     {
         if !tex.get_info().bind.contains(DEPTH_STENCIL) {
             return Err(TargetViewError::NoBindFlag)
         }
-        let desc = tex::DepthStencilDesc {
+        let desc = texture::DepthStencilDesc {
             level: level,
             layer: layer,
             flags: flags,
@@ -507,21 +388,23 @@ pub trait Factory<R: Resources> {
     fn view_texture_as_depth_stencil_trivial<T: format::DepthFormat>(&mut self, tex: &handle::Texture<R, T::Surface>)
                                             -> Result<handle::DepthStencilView<R, T>, TargetViewError>
     {
-        self.view_texture_as_depth_stencil(tex, 0, None, tex::DepthStencilFlags::empty())
+        self.view_texture_as_depth_stencil(tex, 0, None, texture::DepthStencilFlags::empty())
     }
 
-    fn create_texture_const_u8<T: format::TextureFormat>(&mut self, kind: tex::Kind, data: &[&[u8]])
-                               -> Result<(handle::Texture<R, T::Surface>, handle::ShaderResourceView<R, T::View>), CombinedError>
+    fn create_texture_immutable_u8<T: format::TextureFormat>(&mut self, kind: texture::Kind, data: &[&[u8]])
+                                   -> Result<(handle::Texture<R, T::Surface>,
+                                              handle::ShaderResourceView<R, T::View>),
+                                             CombinedError>
     {
         let surface = <T::Surface as format::SurfaceTyped>::get_surface_type();
         let num_slices = kind.get_num_slices().unwrap_or(1) as usize;
         let num_faces = if kind.is_cube() {6} else {1};
-        let desc = tex::Descriptor {
+        let desc = texture::Info {
             kind: kind,
-            levels: (data.len() / (num_slices * num_faces)) as tex::Level,
+            levels: (data.len() / (num_slices * num_faces)) as texture::Level,
             format: surface,
             bind: SHADER_RESOURCE,
-            usage: Usage::Const,
+            usage: Usage::Data,
         };
         let cty = <T::Channel as format::ChannelTyped>::get_channel_type();
         let raw = try!(self.create_texture_raw(desc, Some(cty), Some(data)));
@@ -531,9 +414,12 @@ pub trait Factory<R: Resources> {
         Ok((tex, view))
     }
 
-    fn create_texture_const<T: format::TextureFormat>(&mut self, kind: tex::Kind,
-                            data: &[&[<T::Surface as format::SurfaceTyped>::DataType]])
-                            -> Result<(handle::Texture<R, T::Surface>, handle::ShaderResourceView<R, T::View>), CombinedError>
+    fn create_texture_immutable<T: format::TextureFormat>(
+        &mut self,
+        kind: texture::Kind,
+        data: &[&[<T::Surface as format::SurfaceTyped>::DataType]])
+        -> Result<(handle::Texture<R, T::Surface>, handle::ShaderResourceView<R, T::View>),
+                  CombinedError>
     {
         // we can use cast_slice on a 2D slice, have to use a temporary array of slices
         let mut raw_data: [&[u8]; 0x100] = [&[]; 0x100];
@@ -541,47 +427,47 @@ pub trait Factory<R: Resources> {
         for (rd, d) in raw_data.iter_mut().zip(data.iter()) {
             *rd = cast_slice(*d);
         }
-        self.create_texture_const_u8::<T>(kind, &raw_data[.. data.len()])
+        self.create_texture_immutable_u8::<T>(kind, &raw_data[.. data.len()])
     }
 
     fn create_render_target<T: format::RenderFormat + format::TextureFormat>
-                           (&mut self, width: tex::Size, height: tex::Size)
+                           (&mut self, width: texture::Size, height: texture::Size)
                             -> Result<(handle::Texture<R, T::Surface>,
                                        handle::ShaderResourceView<R, T::View>,
                                        handle::RenderTargetView<R, T>
                                 ), CombinedError>
     {
-        let kind = tex::Kind::D2(width, height, tex::AaMode::Single);
+        let kind = texture::Kind::D2(width, height, texture::AaMode::Single);
         let levels = 1;
         let cty = <T::Channel as format::ChannelTyped>::get_channel_type();
-        let tex = try!(self.create_texture(kind, levels, SHADER_RESOURCE | RENDER_TARGET, Usage::GpuOnly, Some(cty)));
+        let tex = try!(self.create_texture(kind, levels, SHADER_RESOURCE | RENDER_TARGET, Usage::Data, Some(cty)));
         let resource = try!(self.view_texture_as_shader_resource::<T>(&tex, (0, levels-1), format::Swizzle::new()));
         let target = try!(self.view_texture_as_render_target(&tex, 0, None));
         Ok((tex, resource, target))
     }
 
     fn create_depth_stencil<T: format::DepthFormat + format::TextureFormat>
-                           (&mut self, width: tex::Size, height: tex::Size)
+                           (&mut self, width: texture::Size, height: texture::Size)
                             -> Result<(handle::Texture<R, T::Surface>,
                                        handle::ShaderResourceView<R, T::View>,
                                        handle::DepthStencilView<R, T>
                                 ), CombinedError>
     {
-        let kind = tex::Kind::D2(width, height, tex::AaMode::Single);
+        let kind = texture::Kind::D2(width, height, texture::AaMode::Single);
         let cty = <T::Channel as format::ChannelTyped>::get_channel_type();
-        let tex = try!(self.create_texture(kind, 1, SHADER_RESOURCE | DEPTH_STENCIL, Usage::GpuOnly, Some(cty)));
+        let tex = try!(self.create_texture(kind, 1, SHADER_RESOURCE | DEPTH_STENCIL, Usage::Data, Some(cty)));
         let resource = try!(self.view_texture_as_shader_resource::<T>(&tex, (0, 0), format::Swizzle::new()));
         let target = try!(self.view_texture_as_depth_stencil_trivial(&tex));
         Ok((tex, resource, target))
     }
 
     fn create_depth_stencil_view_only<T: format::DepthFormat + format::TextureFormat>
-                                     (&mut self, width: tex::Size, height: tex::Size)
+                                     (&mut self, width: texture::Size, height: texture::Size)
                                       -> Result<handle::DepthStencilView<R, T>, CombinedError>
     {
-        let kind = tex::Kind::D2(width, height, tex::AaMode::Single);
+        let kind = texture::Kind::D2(width, height, texture::AaMode::Single);
         let cty = <T::Channel as format::ChannelTyped>::get_channel_type();
-        let tex = try!(self.create_texture(kind, 1, DEPTH_STENCIL, Usage::GpuOnly, Some(cty)));
+        let tex = try!(self.create_texture(kind, 1, DEPTH_STENCIL, Usage::Data, Some(cty)));
         let target = try!(self.view_texture_as_depth_stencil_trivial(&tex));
         Ok(target)
     }

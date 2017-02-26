@@ -13,27 +13,27 @@
 // limitations under the License.
 
 
-use cocoa::base::{selector, class};
-use cocoa::foundation::{NSUInteger};
+// use cocoa::base::{selector, class};
+// use cocoa::foundation::{NSUInteger};
 
-use gfx_core;
-use gfx_core::shade;
+use core::{self, shade};
 
 use metal::*;
 
-fn map_base_type_from_component(ct: MTLDataType) -> shade::BaseType {
-    use metal::MTLDataType::*;
+pub fn map_base_type_to_format(ty: shade::BaseType) -> MTLVertexFormat {
+    use core::shade::BaseType::*;
 
-    match ct {
-        Float | Float2 | Float3 | Float4 |
-        Float2x2 | Float2x3 | Float2x4 |
-        Float3x2 | Float3x3 | Float3x4 |
-        Float4x2 | Float4x3 | Float4x4 => shade::BaseType::F32,
-        _ => shade::BaseType::I32
+    match ty {
+        I32 => MTLVertexFormat::Int,
+        U32 => MTLVertexFormat::UInt,
+        F32 => MTLVertexFormat::Float,
+        Bool => MTLVertexFormat::Char2,
+        F64 => { unimplemented!() }
     }
 }
 
-pub fn populate_vertex_attributes(info: &mut shade::ProgramInfo, desc: NSArray<MTLVertexAttribute>) {
+pub fn populate_vertex_attributes(info: &mut shade::ProgramInfo,
+                                  desc: NSArray<MTLVertexAttribute>) {
     use map::{map_base_type, map_container_type};
 
     for idx in 0..desc.count() {
@@ -41,16 +41,16 @@ pub fn populate_vertex_attributes(info: &mut shade::ProgramInfo, desc: NSArray<M
 
         info.vertex_attributes.push(shade::AttributeVar {
             name: attr.name().into(),
-            slot: attr.attribute_index() as gfx_core::AttributeSlot,
+            slot: attr.attribute_index() as core::AttributeSlot,
             base_type: map_base_type(attr.attribute_type()),
             container: map_container_type(attr.attribute_type()),
         });
     }
 }
 
-pub fn populate_info(info: &mut shade::ProgramInfo, stage: shade::Stage,
+pub fn populate_info(info: &mut shade::ProgramInfo,
+                     stage: shade::Stage,
                      args: NSArray<MTLArgument>) {
-    use gfx_core::shade::Stage;
     use map::{map_base_type, map_texture_type};
 
     let usage = stage.into();
@@ -61,37 +61,37 @@ pub fn populate_info(info: &mut shade::ProgramInfo, stage: shade::Stage,
 
         match arg.type_() {
             MTLArgumentType::Buffer => {
-                // we skip the buffer with slot 30 which is used in our fake
-                // PSO
-                if arg.index() == 30 { continue; }
+                if name.starts_with("vertexBuffer.") {
+                    continue;
+                }
 
                 info.constant_buffers.push(shade::ConstantBufferVar {
                     name: name.into(),
-                    slot: arg.index() as gfx_core::ConstantBufferSlot,
+                    slot: arg.index() as core::ConstantBufferSlot,
                     size: arg.buffer_data_size() as usize,
                     usage: usage,
+                    elements: Vec::new(), // TODO!
                 });
-            },
+            }
             MTLArgumentType::Texture => {
                 info.textures.push(shade::TextureVar {
                     name: name.into(),
-                    slot: arg.index() as gfx_core::ResourceViewSlot,
+                    slot: arg.index() as core::ResourceViewSlot,
                     base_type: map_base_type(arg.texture_data_type()),
                     ty: map_texture_type(arg.texture_type()),
                     usage: usage,
                 });
-            },
+            }
             MTLArgumentType::Sampler => {
                 let name = name.trim_right_matches('_');
 
                 info.samplers.push(shade::SamplerVar {
                     name: name.into(),
-                    slot: arg.index() as gfx_core::SamplerSlot,
-                    ty: shade::SamplerType(shade::IsComparison::NoCompare,
-                                           shade::IsRect::NoRect),
+                    slot: arg.index() as core::SamplerSlot,
+                    ty: shade::SamplerType(shade::IsComparison::NoCompare, shade::IsRect::NoRect),
                     usage: usage,
                 });
-            },
+            }
             _ => {}
 
         }

@@ -21,16 +21,12 @@ extern crate glutin;
 extern crate gfx_gl as gl;
 extern crate gfx_device_gl;
 
-use cgmath::{SquareMatrix, Matrix, Point3, Vector3, Matrix3, Matrix4};
-use cgmath::{Transform, Vector4};
+use cgmath::{SquareMatrix, Matrix, Point3, Vector3, Matrix3, Matrix4, Vector4};
 pub use gfx::format::{DepthStencil, Rgba8 as ColorFormat};
 //use glfw::Context;
 use gl::Gl;
 use gl::types::*;
-use std::mem;
-use std::ptr;
-use std::str;
-use std::env;
+use std::{mem, ptr, str, env};
 use std::str::FromStr;
 use std::iter::repeat;
 use std::ffi::CString;
@@ -151,10 +147,6 @@ impl GFX {
     }
 }
 
-fn duration_to_f64(dur: Duration) -> f64 {
-   dur.as_secs() as f64 + dur.subsec_nanos() as f64 / 1000_000_000.0
-}
-
 impl Renderer for GFX {
     fn render(&mut self, proj_view: &Matrix4<f32>) {
         let start = Instant::now();
@@ -177,10 +169,10 @@ impl Renderer for GFX {
         self.device.cleanup();
         let swap = start.elapsed();
 
-        println!("total time:\t\t{0:4.2}ms", duration_to_f64(swap));
-        println!("\tcreate list:\t{0:4.2}ms", duration_to_f64(pre_submit));
-        println!("\tsubmit:\t\t{0:4.2}ms", duration_to_f64(post_submit - pre_submit));
-        println!("\tgpu wait:\t{0:4.2}ms", duration_to_f64(swap - post_submit));
+        println!("total time:\t\t{0:4.2}ms", duration_to_ms(swap));
+        println!("\tcreate list:\t{0:4.2}ms", duration_to_ms(pre_submit));
+        println!("\tsubmit:\t\t{0:4.2}ms", duration_to_ms(post_submit - pre_submit));
+        println!("\tgpu wait:\t{0:4.2}ms", duration_to_ms(swap - post_submit));
     }
     fn window(&mut self) -> &glutin::Window { &self.window }
 }

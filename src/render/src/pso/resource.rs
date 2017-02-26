@@ -15,28 +15,32 @@
 //! Resource components for a PSO.
 
 use std::marker::PhantomData;
-use gfx_core::{ResourceViewSlot, UnorderedViewSlot, SamplerSlot, Resources};
-use gfx_core::{handle, pso, shade};
-use gfx_core::factory::Typed;
-use gfx_core::format::Format;
-use super::{DataLink, DataBind, RawDataSet};
+use core::{ResourceViewSlot, UnorderedViewSlot, SamplerSlot, Resources};
+use core::{handle, pso, shade};
+use core::memory::Typed;
+use core::format::Format;
+use super::{DataLink, DataBind, RawDataSet, AccessInfo};
 
 /// Shader resource component (SRV). Typically is a view into some texture,
 /// but can also be a buffer.
+///
 /// - init: `&str` = name of the resource
 /// - data: `ShaderResourceView<T>`
 pub struct ShaderResource<T>(RawShaderResource, PhantomData<T>);
 /// Raw (untyped) shader resource (SRV).
+///
 /// - init: `&str` = name of the resource. This may change in the future.
 /// - data: `RawShaderResourceView`
 pub struct RawShaderResource(Option<(ResourceViewSlot, shade::Usage)>);
 /// Unordered access component (UAV). A writable resource (texture/buffer)
 /// with no defined access order across simultaneously executing shaders.
 /// Supported on DX10 and higher.
+///
 /// - init: `&str` = name of the resource
 /// - data: `UnorderedAccessView<T>`
 pub struct UnorderedAccess<T>(Option<(UnorderedViewSlot, shade::Usage)>, PhantomData<T>);
 /// Sampler component.
+///
 /// - init: `&str` = name of the sampler
 /// - data: `Sampler`
 pub struct Sampler(Option<(SamplerSlot, shade::Usage)>);
@@ -44,6 +48,7 @@ pub struct Sampler(Option<(SamplerSlot, shade::Usage)>);
 /// It only makes sense for DX9 class hardware, where every texture by default
 /// is bundled with a sampler, hence they are represented by the same name.
 /// In DX10 and higher samplers are totally separated from the textures.
+///
 /// - init: `&str` = name of the sampler/texture (assuming they match)
 /// - data: (`ShaderResourceView<T>`, `Sampler`)
 pub struct TextureSampler<T>(ShaderResource<T>, Sampler);
@@ -58,15 +63,19 @@ impl<'a, T> DataLink<'a> for ShaderResource<T> {
         self.0.is_active()
     }
     fn link_resource_view(&mut self, var: &shade::TextureVar, init: &Self::Init)
-                          -> Option<Result<(), Format>> {
+                          -> Option<Result<pso::ResourceViewDesc, Format>> {
         self.0.link_resource_view(var, init)
     }
 }
 
 impl<R: Resources, T> DataBind<R> for ShaderResource<T> {
     type Data = handle::ShaderResourceView<R, T>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
-        self.0.bind_to(out, data.raw(), man)
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               access: &mut AccessInfo<R>) {
+        self.0.bind_to(out, data.raw(), man, access)
     }
 }
 
@@ -80,10 +89,10 @@ impl<'a> DataLink<'a> for RawShaderResource {
         self.0.is_some()
     }
     fn link_resource_view(&mut self, var: &shade::TextureVar, init: &Self::Init)
-                          -> Option<Result<(), Format>> {
+                          -> Option<Result<pso::ResourceViewDesc, Format>> {
         if *init == var.name {
             self.0 = Some((var.slot, var.usage));
-            Some(Ok(())) //TODO: check format
+            Some(Ok(var.usage)) //TODO: check format
         }else {
             None
         }
@@ -92,7 +101,12 @@ impl<'a> DataLink<'a> for RawShaderResource {
 
 impl<R: Resources> DataBind<R> for RawShaderResource {
     type Data = handle::RawShaderResourceView<R>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
+        // TODO: register buffer view source access
         if let Some((slot, usage)) = self.0 {
             let view = man.ref_srv(data).clone();
             out.resource_views.push(pso::ResourceViewParam(view, usage, slot));
@@ -110,10 +124,10 @@ impl<'a, T> DataLink<'a> for UnorderedAccess<T> {
         self.0.is_some()
     }
     fn link_unordered_view(&mut self, var: &shade::UnorderedVar, init: &Self::Init)
-                           -> Option<Result<(), Format>> {
+                           -> Option<Result<pso::UnorderedViewDesc, Format>> {
         if *init == var.name {
             self.0 = Some((var.slot, var.usage));
-            Some(Ok(())) //TODO: check format
+            Some(Ok(var.usage)) //TODO: check format
         }else {
             None
         }
@@ -122,7 +136,12 @@ impl<'a, T> DataLink<'a> for UnorderedAccess<T> {
 
 impl<R: Resources, T> DataBind<R> for UnorderedAccess<T> {
     type Data = handle::UnorderedAccessView<R, T>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
+        // TODO: register buffer view source access
         if let Some((slot, usage)) = self.0 {
             let view =  man.ref_uav(data.raw()).clone();
             out.unordered_views.push(pso::UnorderedViewParam(view, usage, slot));
@@ -139,10 +158,11 @@ impl<'a> DataLink<'a> for Sampler {
     fn is_active(&self) -> bool {
         self.0.is_some()
     }
-    fn link_sampler(&mut self, var: &shade::SamplerVar, init: &Self::Init) -> Option<()> {
+    fn link_sampler(&mut self, var: &shade::SamplerVar, init: &Self::Init)
+                    -> Option<pso::SamplerDesc> {
         if *init == var.name {
             self.0 = Some((var.slot, var.usage));
-            Some(())
+            Some(var.usage)
         }else {
             None
         }
@@ -151,7 +171,11 @@ impl<'a> DataLink<'a> for Sampler {
 
 impl<R: Resources> DataBind<R> for Sampler {
     type Data = handle::Sampler<R>;
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               _: &mut AccessInfo<R>) {
         if let Some((slot, usage)) = self.0 {
             let sm = man.ref_sampler(data).clone();
             out.samplers.push(pso::SamplerParam(sm, usage, slot));
@@ -169,18 +193,22 @@ impl<'a, T> DataLink<'a> for TextureSampler<T> {
         self.0.is_active()
     }
     fn link_resource_view(&mut self, var: &shade::TextureVar, init: &Self::Init)
-                          -> Option<Result<(), Format>> {
+                          -> Option<Result<pso::ResourceViewDesc, Format>> {
         self.0.link_resource_view(var, init)
     }
-    fn link_sampler(&mut self, var: &shade::SamplerVar, init: &Self::Init) -> Option<()> {
+    fn link_sampler(&mut self, var: &shade::SamplerVar, init: &Self::Init) -> Option<pso::SamplerDesc> {
         self.1.link_sampler(var, init)
     }
 }
 
 impl<R: Resources, T> DataBind<R> for TextureSampler<T> {
     type Data = (handle::ShaderResourceView<R, T>, handle::Sampler<R>);
-    fn bind_to(&self, out: &mut RawDataSet<R>, data: &Self::Data, man: &mut handle::Manager<R>) {
-        self.0.bind_to(out, &data.0, man);
-        self.1.bind_to(out, &data.1, man);
+    fn bind_to(&self,
+               out: &mut RawDataSet<R>,
+               data: &Self::Data,
+               man: &mut handle::Manager<R>,
+               access: &mut AccessInfo<R>) {
+        self.0.bind_to(out, &data.0, man, access);
+        self.1.bind_to(out, &data.1, man, access);
     }
 }

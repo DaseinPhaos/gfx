@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use std::iter::repeat;
-use gfx_core as d;
-use gfx_core::shade as s;
+use core::{self as c, shade as s};
 use info::PrivateCaps;
 use gl;
 
@@ -58,6 +57,8 @@ pub fn create_shader(gl: &gl::Gl, stage: s::Stage, data: &[u8])
                      -> Result<super::Shader, s::CreateShaderError> {
     let target = match stage {
         s::Stage::Vertex => gl::VERTEX_SHADER,
+        s::Stage::Hull => gl::TESS_CONTROL_SHADER,
+        s::Stage::Domain => gl::TESS_EVALUATION_SHADER,
         s::Stage::Geometry => gl::GEOMETRY_SHADER,
         s::Stage::Pixel => gl::FRAGMENT_SHADER,
     };
@@ -91,11 +92,11 @@ enum StorageType {
 
 impl StorageType {
     fn new(storage: gl::types::GLenum) -> StorageType {
-        use gfx_core::shade::{BaseType, ContainerType, TextureType, SamplerType, MatrixFormat};
-        use gfx_core::shade::IsArray::*;
-        use gfx_core::shade::IsRect::*;
-        use gfx_core::shade::IsComparison::*;
-        use gfx_core::shade::IsMultiSample::*;
+        use core::shade::{BaseType, ContainerType, TextureType, SamplerType, MatrixFormat};
+        use core::shade::IsArray::*;
+        use core::shade::IsRect::*;
+        use core::shade::IsComparison::*;
+        use core::shade::IsMultiSample::*;
         use self::StorageType::*;
         match storage {
             gl::FLOAT                        => Var(BaseType::F32,  ContainerType::Single),
@@ -201,7 +202,7 @@ fn query_attributes(gl: &gl::Gl, prog: super::Program) -> Vec<s::AttributeVar> {
         }
         s::AttributeVar {
             name: real_name,
-            slot: loc as d::AttributeSlot,
+            slot: loc as c::AttributeSlot,
             base_type: base,
             container: container,
         }
@@ -209,7 +210,8 @@ fn query_attributes(gl: &gl::Gl, prog: super::Program) -> Vec<s::AttributeVar> {
     .collect()
 }
 
-fn query_blocks(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program)
+fn query_blocks(gl: &gl::Gl, caps: &c::Capabilities, prog: super::Program,
+                block_indices: &[gl::types::GLint], block_offsets: &[gl::types::GLint])
                 -> Vec<s::ConstantBufferVar> {
     let num = if caps.constant_buffer_supported {
         get_program_iv(gl, prog, gl::ACTIVE_UNIFORM_BLOCKS)
@@ -225,7 +227,13 @@ fn query_blocks(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program)
     // `layout(binding = n)`
     let explicit_binding = bindings.iter().any(|&i| i > 0);
 
-    (0..num as gl::types::GLuint).zip(bindings.iter()).map(|(idx, &bind)| {
+    // Some implementations seem to return the length of the uniform name without
+    // null termination. Therefore we allocate an extra byte here.
+    let max_len = get_program_iv(gl, prog, gl::ACTIVE_UNIFORM_MAX_LENGTH) + 1;
+    let mut el_name = String::with_capacity(max_len as usize);
+    el_name.extend(repeat('\0').take(max_len as usize));
+
+    (0 .. num as gl::types::GLuint).zip(bindings.iter()).map(|(idx, &bind)| {
         // the string identifier for the block
         let name = unsafe {
             let size = get_block_iv(gl, prog, idx, gl::UNIFORM_BLOCK_NAME_LENGTH);
@@ -254,7 +262,7 @@ fn query_blocks(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program)
             usage
         };
 
-        let size = get_block_iv(gl, prog, idx, gl::UNIFORM_BLOCK_DATA_SIZE);
+        let total_size = get_block_iv(gl, prog, idx, gl::UNIFORM_BLOCK_DATA_SIZE);
 
         // if we don't detect any explicit layout bindings in the program, we
         // automatically assign them a binding to their respective block indices
@@ -265,29 +273,62 @@ fn query_blocks(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program)
             idx
         };
 
-        info!("\t\tBlock[{}] = '{}' of size {}", slot, name, size);
+        info!("\t\tBlock[{}] = '{}' of size {}", slot, name, total_size);
         s::ConstantBufferVar {
             name: name,
-            slot: slot as d::ConstantBufferSlot,
-            size: size as usize,
+            slot: slot as c::ConstantBufferSlot,
+            size: total_size as usize,
             usage: usage,
+            elements: block_indices.iter().zip(block_offsets.iter()).enumerate().filter_map(|(i, (parent, offset))| {
+                if *parent == idx as gl::types::GLint {
+                    let mut length = 0;
+                    let mut size = 0;
+                    let mut storage = 0;
+                    unsafe {
+                        let raw = (&el_name[..]).as_ptr() as *mut gl::types::GLchar;
+                        gl.GetActiveUniform(prog, i as gl::types::GLuint, max_len, &mut length, &mut size, &mut storage, raw);
+                    };
+                    let real_name = el_name[..length as usize].to_string();
+                    let (base, container) = match StorageType::new(storage) {
+                        StorageType::Var(base, cont) => {
+                            info!("\t\t\tElement at {}\t= '{}'\t{:?}\t{:?}", *offset, real_name, base, cont);
+                            (base, cont)
+                        },
+                        _ => {
+                            error!("Unrecognized element storage: {}", storage);
+                            (s::BaseType::F32, s::ContainerType::Single)
+                        },
+                    };
+                    Some(s::ConstVar {
+                        name: real_name,
+                        location: *offset as s::Location,
+                        count: size as usize,
+                        base_type: base,
+                        container: container,
+                    })
+                } else { None }
+            }).collect()
         }
     }).collect()
 }
 
-fn query_parameters(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program, usage: s::Usage)
-                    -> (Vec<s::ConstVar>, Vec<s::TextureVar>, Vec<s::SamplerVar>) {
+fn query_parameters(gl: &gl::Gl, caps: &c::Capabilities, prog: super::Program, usage: s::Usage)
+                    -> (Vec<s::ConstVar>, Vec<s::TextureVar>, Vec<s::SamplerVar>, Vec<gl::types::GLint>, Vec<gl::types::GLint>) {
     let mut uniforms = Vec::new();
     let mut textures = Vec::new();
     let mut samplers = Vec::new();
     let total_num = get_program_iv(gl, prog, gl::ACTIVE_UNIFORMS);
     let indices: Vec<_> = (0..total_num as gl::types::GLuint).collect();
-    let mut block_indices: Vec<gl::types::GLint> = repeat(-1 as gl::types::GLint).take(total_num as usize).collect();
+    let mut block_indices = vec![-1 as gl::types::GLint; total_num as usize];
+    let mut block_offsets = vec![-1 as gl::types::GLint; total_num as usize];
     if caps.constant_buffer_supported {
         unsafe {
             gl.GetActiveUniformsiv(prog, total_num as gl::types::GLsizei,
                 (&indices[..]).as_ptr(), gl::UNIFORM_BLOCK_INDEX,
                 block_indices.as_mut_ptr());
+            gl.GetActiveUniformsiv(prog, total_num as gl::types::GLsizei,
+                (&indices[..]).as_ptr(), gl::UNIFORM_OFFSET,
+                block_offsets.as_mut_ptr());
         }
         //TODO: UNIFORM_IS_ROW_MAJOR
     }
@@ -332,7 +373,7 @@ fn query_parameters(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program, u
                 info!("\t\tSampler[{}] = '{}'\t{:?}\t{:?}", slot, real_name, base, tex_type);
                 textures.push(s::TextureVar {
                     name: real_name.clone(),
-                    slot: slot as d::ResourceViewSlot,
+                    slot: slot as c::ResourceViewSlot,
                     base_type: base,
                     ty: tex_type,
                     usage: usage,
@@ -340,7 +381,7 @@ fn query_parameters(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program, u
                 if tex_type.can_sample() {
                     samplers.push(s::SamplerVar {
                         name: real_name,
-                        slot: slot as d::SamplerSlot,
+                        slot: slot as c::SamplerSlot,
                         ty: samp_type,
                         usage: usage,
                     });
@@ -351,7 +392,7 @@ fn query_parameters(gl: &gl::Gl, caps: &d::Capabilities, prog: super::Program, u
             },
         }
     }
-    (uniforms, textures, samplers)
+    (uniforms, textures, samplers, block_indices, block_offsets)
 }
 
 fn query_outputs(gl: &gl::Gl, prog: super::Program) -> (Vec<s::OutputVar>, bool) {
@@ -433,12 +474,21 @@ pub fn get_program_log(gl: &gl::Gl, name: super::Program) -> String {
     }
 }
 
-pub fn create_program(gl: &gl::Gl, caps: &d::Capabilities, private: &PrivateCaps,
+pub fn create_program(gl: &gl::Gl, caps: &c::Capabilities, private: &PrivateCaps,
                       shaders: &[super::Shader], usage: s::Usage)
                       -> Result<(::Program, s::ProgramInfo), s::CreateProgramError> {
     let name = unsafe { gl.CreateProgram() };
     for &sh in shaders {
         unsafe { gl.AttachShader(name, sh) };
+    }
+
+    if !private.program_interface_supported {
+        for i in 0..c::MAX_COLOR_TARGETS {
+            let color_name = format!("Target{}\0", i);
+            unsafe {
+                gl.BindFragDataLocation(name, i as u32, (&color_name[..]).as_ptr() as *mut gl::types::GLchar);
+            }
+         }
     }
 
     unsafe { gl.LinkProgram(name) };
@@ -451,11 +501,12 @@ pub fn create_program(gl: &gl::Gl, caps: &d::Capabilities, private: &PrivateCaps
             warn!("\tLog: {}", log);
         }
 
-        let (uniforms, textures, samplers) = query_parameters(gl, caps, name, usage);
+        let (uniforms, textures, samplers, block_indices, block_offsets) =
+            query_parameters(gl, caps, name, usage);
         let mut info = s::ProgramInfo {
             vertex_attributes: query_attributes(gl, name),
             globals: uniforms,
-            constant_buffers: query_blocks(gl, caps, name),
+            constant_buffers: query_blocks(gl, caps, name, &block_indices, &block_offsets),
             textures: textures,
             unordereds: Vec::new(), //TODO
             samplers: samplers,
@@ -473,12 +524,12 @@ pub fn create_program(gl: &gl::Gl, caps: &d::Capabilities, private: &PrivateCaps
 
         Ok((name, info))
     } else {
-        Err(log)
+        Err(log.into())
     }
 }
 
 pub fn bind_uniform(gl: &gl::Gl, loc: gl::types::GLint, uniform: s::UniformValue) {
-    use gfx_core::shade::UniformValue;
+    use core::shade::UniformValue;
     match uniform {
         UniformValue::I32(val) => unsafe { gl.Uniform1i(loc, val) },
         UniformValue::F32(val) => unsafe { gl.Uniform1f(loc, val) },

@@ -47,9 +47,9 @@ pub mod bundle;
 use std::default::Default;
 use std::error::Error;
 use std::fmt;
-use gfx_core as d;
-pub use gfx_core::pso::{Descriptor};
-
+use core as c;
+pub use core::pso::Descriptor;
+pub use core::command::AccessInfo;
 
 /// A complete set of raw data that needs to be specified at run-time
 /// whenever we draw something with a PSO. This is what "data" struct
@@ -58,94 +58,193 @@ pub use gfx_core::pso::{Descriptor};
 /// format and layout to expect from each resource.
 #[allow(missing_docs)]
 #[derive(Debug)]
-pub struct RawDataSet<R: d::Resources>{
-    pub vertex_buffers: d::pso::VertexBufferSet<R>,
-    pub constant_buffers: Vec<d::pso::ConstantBufferParam<R>>,
-    pub global_constants: Vec<(d::shade::Location, d::shade::UniformValue)>,
-    pub resource_views: Vec<d::pso::ResourceViewParam<R>>,
-    pub unordered_views: Vec<d::pso::UnorderedViewParam<R>>,
-    pub samplers: Vec<d::pso::SamplerParam<R>>,
-    pub pixel_targets: d::pso::PixelTargetSet<R>,
-    pub ref_values: d::state::RefValues,
-    pub scissor: d::target::Rect,
+pub struct RawDataSet<R: c::Resources>{
+    pub vertex_buffers: c::pso::VertexBufferSet<R>,
+    pub constant_buffers: Vec<c::pso::ConstantBufferParam<R>>,
+    pub global_constants: Vec<(c::shade::Location, c::shade::UniformValue)>,
+    pub resource_views: Vec<c::pso::ResourceViewParam<R>>,
+    pub unordered_views: Vec<c::pso::UnorderedViewParam<R>>,
+    pub samplers: Vec<c::pso::SamplerParam<R>>,
+    pub pixel_targets: c::pso::PixelTargetSet<R>,
+    pub ref_values: c::state::RefValues,
+    pub scissor: c::target::Rect,
 }
 
-impl<R: d::Resources> RawDataSet<R> {
+impl<R: c::Resources> RawDataSet<R> {
     /// Create an empty data set.
     pub fn new() -> RawDataSet<R> {
         RawDataSet {
-            vertex_buffers: d::pso::VertexBufferSet::new(),
+            vertex_buffers: c::pso::VertexBufferSet::new(),
             constant_buffers: Vec::new(),
             global_constants: Vec::new(),
             resource_views: Vec::new(),
             unordered_views: Vec::new(),
             samplers: Vec::new(),
-            pixel_targets: d::pso::PixelTargetSet::new(),
+            pixel_targets: c::pso::PixelTargetSet::new(),
             ref_values: Default::default(),
-            scissor: d::target::Rect{x:0, y:0, w:1, h:1},
+            scissor: c::target::Rect{x:0, y:0, w:1, h:1},
         }
     }
     /// Clear all contained data.
     pub fn clear(&mut self) {
-        self.vertex_buffers = d::pso::VertexBufferSet::new();
+        self.vertex_buffers = c::pso::VertexBufferSet::new();
         self.constant_buffers.clear();
         self.global_constants.clear();
         self.resource_views.clear();
         self.unordered_views.clear();
         self.samplers.clear();
-        self.pixel_targets = d::pso::PixelTargetSet::new();
+        self.pixel_targets = c::pso::PixelTargetSet::new();
         self.ref_values = Default::default();
-        self.scissor = d::target::Rect{x:0, y:0, w:1, h:1};
+        self.scissor = c::target::Rect{x:0, y:0, w:1, h:1};
+    }
+}
+
+/// Error matching an element inside the constant buffer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ElementError<S> {
+    /// Element not found.
+    NotFound(S),
+    /// Element offset mismatch.
+    Offset {
+        /// Element name.
+        name: S,
+        /// Element byte offset in the shader-side constant buffer.
+        shader_offset: c::pso::ElemOffset,
+        /// Element byte offset in the code-side constant buffer.
+        code_offset: c::pso::ElemOffset
+    },
+    /// Element format mismatch.
+    Format {
+        /// Element name.
+        name: S,
+        /// Element format in the shader-side constant buffer.
+        shader_format: c::shade::ConstFormat,
+        /// Element format in the code-side constant buffer.
+        code_format: c::shade::ConstFormat,
+    },
+}
+
+impl<S: fmt::Debug + fmt::Display> fmt::Display for ElementError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            ElementError::NotFound(ref s) => write!(f, "{}: {:?}", self.description(), s),
+            ElementError::Offset{ ref name, ref shader_offset, ref code_offset } =>
+                write!(f, "{}: ({:?}, {:?}, {:?})", self.description(), name, shader_offset, code_offset),
+            ElementError::Format{ ref name, ref shader_format, ref code_format } =>
+                write!(f, "{}: ({:?}, {:?}, {:?})", self.description(), name, shader_format, code_format),
+        }
+    }
+}
+
+impl<S: fmt::Debug + fmt::Display> Error for ElementError<S> {
+    fn description(&self) -> &str {
+        match *self {
+            ElementError::NotFound(_) => "Element not found",
+            ElementError::Offset{..} => "Element offset mismatch",
+            ElementError::Format{..} => "Element format mismatch",
+        }
+    }
+}
+
+impl<'a> From<ElementError<&'a str>> for ElementError<String> {
+    fn from(other: ElementError<&'a str>) -> ElementError<String> {
+        use self::ElementError::*;
+        match other {
+            NotFound(s) => NotFound(s.to_owned()),
+            Offset{ name, shader_offset, code_offset } => Offset{
+                name: name.to_owned(),
+                shader_offset: shader_offset,
+                code_offset: code_offset,
+            },
+            Format{ name, shader_format, code_format } => Format{
+                name: name.to_owned(),
+                shader_format: shader_format,
+                code_format: code_format,
+            },
+        }
     }
 }
 
 /// Failure to initilize the link between the shader and the data.
 #[derive(Clone, PartialEq, Debug)]
-pub enum InitError {
+pub enum InitError<S> {
     /// Vertex attribute mismatch.
-    VertexImport(d::AttributeSlot, Option<d::format::Format>),
+    VertexImport(S, Option<c::format::Format>),
     /// Constant buffer mismatch.
-    ConstantBuffer(d::ConstantBufferSlot, Option<()>),
+    ConstantBuffer(S, Option<ElementError<S>>),
     /// Global constant mismatch.
-    GlobalConstant(d::shade::Location, Option<()>),
+    GlobalConstant(S, Option<()>),
     /// Shader resource view mismatch.
-    ResourceView(d::ResourceViewSlot, Option<()>),
+    ResourceView(S, Option<()>),
     /// Unordered access view mismatch.
-    UnorderedView(d::UnorderedViewSlot, Option<()>),
+    UnorderedView(S, Option<()>),
     /// Sampler mismatch.
-    Sampler(d::SamplerSlot, Option<()>),
+    Sampler(S, Option<()>),
     /// Pixel target mismatch.
-    PixelExport(d::ColorSlot, Option<d::format::Format>),
+    PixelExport(S, Option<c::format::Format>),
 }
 
-impl fmt::Display for InitError {
+impl<'a> From<InitError<&'a str>> for InitError<String> {
+    fn from(other: InitError<&'a str>) -> InitError<String> {
+        use self::InitError::*;
+        match other {
+            VertexImport(s, v) => VertexImport(s.to_owned(), v),
+            ConstantBuffer(s, v) => ConstantBuffer(s.to_owned(), v.map(|e| e.into())),
+            GlobalConstant(s, v) => GlobalConstant(s.to_owned(), v),
+            ResourceView(s, v) => ResourceView(s.to_owned(), v),
+            UnorderedView(s, v) => UnorderedView(s.to_owned(), v),
+            Sampler(s, v) => Sampler(s.to_owned(), v),
+            PixelExport(s, v) => PixelExport(s.to_owned(), v),
+        }
+    }
+}
+
+impl<S: fmt::Debug + fmt::Display> fmt::Display for InitError<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::InitError::*;
         let desc = self.description();
         match *self {
-            InitError::VertexImport(slot, format) => write!(f, "{}: ({:?}, {:?})", desc, slot, format),
-            InitError::ConstantBuffer(slot, opt) => write!(f, "{}: ({:?}, {:?})", desc, slot, opt),
-            InitError::GlobalConstant(slot, opt) => write!(f, "{}: ({:?}, {:?})", desc, slot, opt),
-            InitError::ResourceView(slot, opt) => write!(f, "{}: ({:?}, {:?})", desc, slot, opt),
-            InitError::UnorderedView(slot, opt) => write!(f, "{}: ({:?}, {:?})", desc, slot, opt),
-            InitError::Sampler(slot, opt) => write!(f, "{}: ({:?}, {:?})", desc, slot, opt),
-            InitError::PixelExport(slot, format) => write!(f, "{}: ({:?}, {:?})", desc, slot, format),
+            VertexImport(ref name, format) => write!(f, "{}: ({}, {:?})", desc, name, format),
+            ConstantBuffer(ref name, ref opt) => write!(f, "{}: ({}, {:?})", desc, name, opt),
+            GlobalConstant(ref name, opt) => write!(f, "{}: ({}, {:?})", desc, name, opt),
+            ResourceView(ref name, opt) => write!(f, "{}: ({}, {:?})", desc, name, opt),
+            UnorderedView(ref name, opt) => write!(f, "{}: ({}, {:?})", desc, name, opt),
+            Sampler(ref name, opt) => write!(f, "{}: ({}, {:?})", desc, name, opt),
+            PixelExport(ref name, format) => write!(f, "{}: ({}, {:?})", desc, name, format),
         }
     }
 }
 
-impl Error for InitError {
+impl<S: fmt::Debug + fmt::Display> Error for InitError<S> {
     fn description(&self) -> &str {
+        use self::InitError::*;
         match *self {
-            InitError::VertexImport(..) => "Vertex attribute mismatch",
-            InitError::ConstantBuffer(..) => "Constant buffer mismatch",
-            InitError::GlobalConstant(..) => "Global constant mismatch",
-            InitError::ResourceView(..) => "Shader resource view mismatch",
-            InitError::UnorderedView(..) => "Unordered access view mismatch",
-            InitError::Sampler(..) => "Sampler mismatch",
-            InitError::PixelExport(..) => "Pixel target mismatch",
+            VertexImport(_, None) => "Vertex attribute not found",
+            VertexImport(..) => "Vertex attribute format mismatch",
+            ConstantBuffer(_, None) => "Constant buffer not found",
+            ConstantBuffer(..) => "Constant buffer element mismatch",
+            GlobalConstant(_, None) => "Global constant not found",
+            GlobalConstant(..) => "Global constant format mismatch",
+            ResourceView(_, None) => "Shader resource view not found",
+            ResourceView(..) => "Shader resource view mismatch",
+            UnorderedView(_, None) => "Unordered access view not found",
+            UnorderedView(..) => "Unordered access view mismatch",
+            Sampler(_, None) => "Sampler not found",
+            Sampler(..) => "Sampler mismatch",
+            PixelExport(_, None) => "Pixel target not found",
+            PixelExport(..) => "Pixel target mismatch",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        if let InitError::ConstantBuffer(_, Some(ref e)) = *self {
+            Some(e)
+        } else {
+            None
         }
     }
 }
+
 
 /// A service trait implemented by the "init" structure of PSO.
 pub trait PipelineInit {
@@ -154,31 +253,35 @@ pub trait PipelineInit {
     /// Attempt to map a PSO descriptor to a give shader program,
     /// represented by `ProgramInfo`. Returns an instance of the
     /// "meta" struct upon successful mapping.
-    fn link_to(&self, &mut Descriptor, &d::shade::ProgramInfo)
-               -> Result<Self::Meta, InitError>;
+    fn link_to<'s>(&self, &mut Descriptor, &'s c::shade::ProgramInfo)
+               -> Result<Self::Meta, InitError<&'s str>>;
 }
 
 /// a service trait implemented the "data" structure of PSO.
-pub trait PipelineData<R: d::Resources> {
+pub trait PipelineData<R: c::Resources> {
     /// The associated "meta" struct.
     type Meta;
     /// Dump all the contained data into the raw data set,
     /// given the mapping ("meta"), and a handle manager.
-    fn bake_to(&self, &mut RawDataSet<R>, meta: &Self::Meta, &mut d::handle::Manager<R>);
+    fn bake_to(&self,
+               &mut RawDataSet<R>,
+               &Self::Meta,
+               &mut c::handle::Manager<R>,
+               &mut AccessInfo<R>);
 }
 
 /// A strongly typed Pipleline State Object. See the module documentation for more information.
-pub struct PipelineState<R: d::Resources, M>(
-    d::handle::RawPipelineState<R>, d::Primitive, M);
+pub struct PipelineState<R: c::Resources, M>(
+    c::handle::RawPipelineState<R>, c::Primitive, M);
 
-impl<R: d::Resources, M> PipelineState<R, M> {
+impl<R: c::Resources, M> PipelineState<R, M> {
     /// Create a new PSO from a raw handle and the "meta" instance.
-    pub fn new(raw: d::handle::RawPipelineState<R>, prim: d::Primitive, meta: M)
+    pub fn new(raw: c::handle::RawPipelineState<R>, prim: c::Primitive, meta: M)
                -> PipelineState<R, M> {
         PipelineState(raw, prim, meta)
     }
     /// Get a raw handle reference.
-    pub fn get_handle(&self) -> &d::handle::RawPipelineState<R> {
+    pub fn get_handle(&self) -> &c::handle::RawPipelineState<R> {
         &self.0
     }
     /// Get a "meta" struct reference. Can be used by the user to check
@@ -197,38 +300,46 @@ pub trait DataLink<'a>: Sized {
     fn new() -> Self;
     /// Check if this link is actually used by the shader.
     fn is_active(&self) -> bool;
+    /// Attempt to link with a vertex buffer containing multiple attributes.
+    fn link_vertex_buffer(&mut self, _: c::pso::BufferIndex, _: &Self::Init) ->
+                          Option<c::pso::VertexBufferDesc> { None }
     /// Attempt to link with a vertex attribute.
-    fn link_input(&mut self, _: &d::shade::AttributeVar, _: &Self::Init) ->
-                  Option<Result<d::pso::AttributeDesc, d::format::Format>> { None }
+    fn link_input(&mut self, _: &c::shade::AttributeVar, _: &Self::Init) ->
+                  Option<Result<c::pso::AttributeDesc, c::format::Format>> { None }
     /// Attempt to link with a constant buffer.
-    fn link_constant_buffer(&mut self, _: &d::shade::ConstantBufferVar, _: &Self::Init) ->
-                            Option<Result<(), d::shade::ConstFormat>> { None }
+    fn link_constant_buffer<'b>(&mut self, _: &'b c::shade::ConstantBufferVar, _: &Self::Init) ->
+                            Option<Result<c::pso::ConstantBufferDesc, ElementError<&'b str>>> { None }
     /// Attempt to link with a global constant.
-    fn link_global_constant(&mut self, _: &d::shade::ConstVar, _: &Self::Init) ->
-                            Option<Result<(), d::shade::UniformValue>> { None }
+    fn link_global_constant(&mut self, _: &c::shade::ConstVar, _: &Self::Init) ->
+                            Option<Result<(), c::shade::UniformValue>> { None }
     /// Attempt to link with an output render target (RTV).
-    fn link_output(&mut self, _: &d::shade::OutputVar, _: &Self::Init) ->
-                   Option<Result<d::pso::ColorTargetDesc, d::format::Format>> { None }
+    fn link_output(&mut self, _: &c::shade::OutputVar, _: &Self::Init) ->
+                   Option<Result<c::pso::ColorTargetDesc, c::format::Format>> { None }
     /// Attempt to link with a depth-stencil target (DSV).
     fn link_depth_stencil(&mut self, _: &Self::Init) ->
-                          Option<d::pso::DepthStencilDesc> { None }
+                          Option<c::pso::DepthStencilDesc> { None }
     /// Attempt to link with a shader resource (SRV).
-    fn link_resource_view(&mut self, _: &d::shade::TextureVar, _: &Self::Init) ->
-                          Option<Result<(), d::format::Format>> { None }
+    fn link_resource_view(&mut self, _: &c::shade::TextureVar, _: &Self::Init) ->
+                          Option<Result<c::pso::ResourceViewDesc, c::format::Format>> { None }
     /// Attempt to link with an unordered access (UAV).
-    fn link_unordered_view(&mut self, _: &d::shade::UnorderedVar, _: &Self::Init) ->
-                           Option<Result<(), d::format::Format>> { None }
+    fn link_unordered_view(&mut self, _: &c::shade::UnorderedVar, _: &Self::Init) ->
+                           Option<Result<c::pso::UnorderedViewDesc, c::format::Format>> { None }
     /// Attempt to link with a sampler.
-    fn link_sampler(&mut self, _: &d::shade::SamplerVar, _: &Self::Init) -> Option<()> { None }
+    fn link_sampler(&mut self, _: &c::shade::SamplerVar, _: &Self::Init)
+                    -> Option<c::pso::SamplerDesc> { None }
     /// Attempt to enable scissor test.
     fn link_scissor(&mut self) -> bool { false }
 }
 
 /// The "bind" logic portion of the PSO component.
 /// Defines how the user data translates into the raw data set.
-pub trait DataBind<R: d::Resources> {
+pub trait DataBind<R: c::Resources> {
     /// The associated "data" type - a member of the PSO "data" struct.
     type Data;
     /// Dump the given data into the raw data set.
-    fn bind_to(&self, &mut RawDataSet<R>, &Self::Data, &mut d::handle::Manager<R>);
+    fn bind_to(&self,
+               &mut RawDataSet<R>,
+               &Self::Data,
+               &mut c::handle::Manager<R>,
+               &mut AccessInfo<R>);
 }

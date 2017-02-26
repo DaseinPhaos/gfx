@@ -23,7 +23,7 @@ use std::io::Cursor;
 use std::time::{Instant};
 pub use gfx_app::ColorFormat;
 pub use gfx::format::{Depth, Rgba8};
-use gfx::Bundle;
+use gfx::{Bundle, texture};
 
 gfx_defines!{
     vertex Vertex {
@@ -73,8 +73,8 @@ fn load_cubemap<R, F>(factory: &mut F, data: CubemapData) -> Result<gfx::handle:
         image::load(Cursor::new(data), image::JPEG).unwrap().to_rgba()
     }).collect::<Vec<_>>();
     let data: [&[u8]; 6] = [&images[0], &images[1], &images[2], &images[3], &images[4], &images[5]];
-    let kind = gfx::tex::Kind::Cube(images[0].dimensions().0 as u16);
-    match factory.create_texture_const_u8::<Rgba8>(kind, &data) {
+    let kind = texture::Kind::Cube(images[0].dimensions().0 as u16);
+    match factory.create_texture_immutable_u8::<Rgba8>(kind, &data) {
         Ok((_, view)) => Ok(view),
         Err(_) => Err("Unable to create an immutable cubemap texture".to_owned()),
     }
@@ -87,7 +87,8 @@ struct App<R: gfx::Resources>{
 }
 
 impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
-    fn new<F: gfx::Factory<R>>(mut factory: F, init: gfx_app::Init<R>) -> Self {
+    fn new<F: gfx::Factory<R>>(factory: &mut F, backend: gfx_app::shade::Backend,
+           window_targets: gfx_app::WindowTargets<R>) -> Self {
         use gfx::traits::FactoryExt;
 
         let vs = gfx_app::shade::Source {
@@ -108,7 +109,7 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         ];
         let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, ());
 
-        let cubemap = load_cubemap(&mut factory, CubemapData {
+        let cubemap = load_cubemap(factory, CubemapData {
             up: &include_bytes!("image/posy.jpg")[..],
             down: &include_bytes!("image/negy.jpg")[..],
             front: &include_bytes!("image/posz.jpg")[..],
@@ -119,11 +120,11 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
 
         let sampler = factory.create_sampler_linear();
 
-        let proj = cgmath::perspective(cgmath::deg(60.0f32), init.aspect_ratio, 0.01, 100.0);
+        let proj = cgmath::perspective(cgmath::deg(60.0f32), window_targets.aspect_ratio, 0.01, 100.0);
 
         let pso = factory.create_pipeline_simple(
-            vs.select(init.backend).unwrap(),
-            ps.select(init.backend).unwrap(),
+            vs.select(backend).unwrap(),
+            ps.select(backend).unwrap(),
             pipe::new()
         ).unwrap();
 
@@ -131,7 +132,7 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             vbuf: vbuf,
             cubemap: (cubemap, sampler),
             locals: factory.create_constant_buffer(1),
-            out: init.color,
+            out: window_targets.color,
         };
 
         App {
@@ -166,9 +167,14 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         encoder.clear(&self.bundle.data.out, [0.3, 0.3, 0.3, 1.0]);
         self.bundle.encode(encoder);
     }
+
+    fn on_resize(&mut self, window_targets: gfx_app::WindowTargets<R>) {
+        self.bundle.data.out = window_targets.color;
+        self.projection = cgmath::perspective(cgmath::deg(60.0f32), window_targets.aspect_ratio, 0.01, 100.0);
+    }
 }
 
 pub fn main() {
     use gfx_app::Application;
-    App::launch_default("Skybox example");
+    App::launch_simple("Skybox example");
 }

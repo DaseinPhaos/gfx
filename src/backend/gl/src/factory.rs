@@ -13,34 +13,48 @@
 // limitations under the License.
 
 use std::rc::Rc;
-use std::slice;
+use std::{slice, ptr};
 
 use {gl, tex};
-use gfx_core as d;
-use gfx_core::factory as f;
-use gfx_core::factory::Typed;
-use gfx_core::format::ChannelType;
-use gfx_core::handle;
-use gfx_core::handle::Producer;
-use gfx_core::mapping::Builder;
-use gfx_core::target::{Layer, Level};
-use gfx_core::tex as t;
+use core::{self as d, factory as f, texture as t, buffer, mapping};
+use core::memory::{self, Bind, SHADER_RESOURCE, UNORDERED_ACCESS, Typed};
+use core::format::ChannelType;
+use core::handle::{self, Producer};
+use core::target::{Layer, Level};
 
 use command::{CommandBuffer, COLOR_DEFAULT};
 use {Resources as R, Share, OutputMerger};
-use {Buffer, FatSampler, NewTexture, PipelineState, ResourceView, TargetView};
+use {Buffer, BufferElement, FatSampler, NewTexture,
+     PipelineState, ResourceView, TargetView, Fence};
 
 
-fn role_to_target(role: f::BufferRole) -> gl::types::GLenum {
+pub fn role_to_target(role: buffer::Role) -> gl::types::GLenum {
     match role {
-        f::BufferRole::Vertex  => gl::ARRAY_BUFFER,
-        f::BufferRole::Index   => gl::ELEMENT_ARRAY_BUFFER,
-        f::BufferRole::Uniform => gl::UNIFORM_BUFFER,
+        buffer::Role::Vertex   => gl::ARRAY_BUFFER,
+        buffer::Role::Index    => gl::ELEMENT_ARRAY_BUFFER,
+        buffer::Role::Constant => gl::UNIFORM_BUFFER,
+        buffer::Role::Staging  => gl::ARRAY_BUFFER,
+    }
+}
+
+fn access_to_map_bits(access: memory::Access) -> gl::types::GLenum {
+    let mut r = 0;
+    if access.contains(memory::READ) { r |= gl::MAP_READ_BIT; }
+    if access.contains(memory::WRITE) { r |= gl::MAP_WRITE_BIT; }
+    r
+}
+
+fn access_to_gl(access: memory::Access) -> gl::types::GLenum {
+    match access {
+        memory::RW => gl::READ_WRITE,
+        memory::READ => gl::READ_ONLY,
+        memory::WRITE => gl::WRITE_ONLY,
+        _ => unreachable!(),
     }
 }
 
 pub fn update_sub_buffer(gl: &gl::Gl, buffer: Buffer, address: *const u8,
-                         size: usize, offset: usize, role: f::BufferRole) {
+                         size: usize, offset: usize, role: buffer::Role) {
     let target = role_to_target(role);
     unsafe {
         gl.BindBuffer(target, buffer);
@@ -91,53 +105,107 @@ impl Factory {
     fn create_buffer_internal(&mut self) -> Buffer {
         let gl = &self.share.context;
         let mut name = 0 as Buffer;
-        unsafe {
-            gl.GenBuffers(1, &mut name);
-        }
+        unsafe { gl.GenBuffers(1, &mut name); }
         info!("\tCreated buffer {}", name);
         name
     }
 
-    fn init_buffer(&mut self, buffer: Buffer, info: &f::BufferInfo) {
+    fn init_buffer(&mut self,
+                   buffer: Buffer,
+                   info: &buffer::Info,
+                   data_opt: Option<&[u8]>) -> Option<MappingGate> {
+        use core::memory::Usage::*;
+
         let gl = &self.share.context;
         let target = role_to_target(info.role);
+        let mut data_ptr = if let Some(data) = data_opt {
+            debug_assert!(data.len() == info.size);
+            data.as_ptr() as *const gl::types::GLvoid
+        } else {
+            0 as *const gl::types::GLvoid
+        };
+
         if self.share.private_caps.buffer_storage_supported {
             let usage = match info.usage {
-                f::Usage::GpuOnly    => 0,
-                _                    => gl::MAP_WRITE_BIT | gl::DYNAMIC_STORAGE_BIT,
+                Data => 0,
+                // TODO: we could use mapping instead of glBufferSubData
+                Dynamic => gl::DYNAMIC_STORAGE_BIT,
+                Upload => access_to_map_bits(memory::WRITE) | gl::MAP_PERSISTENT_BIT,
+                Download => access_to_map_bits(memory::READ) | gl::MAP_PERSISTENT_BIT,
+            };
+            let size = if info.size == 0 {
+                // we are not allowed to pass size=0 into `glBufferStorage`
+                data_ptr = 0 as *const _;
+                1
+            } else {
+                info.size as gl::types::GLsizeiptr
             };
             unsafe {
                 gl.BindBuffer(target, buffer);
                 gl.BufferStorage(target,
-                    info.size as gl::types::GLsizeiptr,
-                    0 as *const gl::types::GLvoid,
+                    size,
+                    data_ptr,
                     usage
                 );
             }
         }
         else {
             let usage = match info.usage {
-                f::Usage::GpuOnly    => gl::STATIC_DRAW,
-                f::Usage::Const      => gl::STATIC_DRAW,
-                f::Usage::Dynamic    => gl::DYNAMIC_DRAW,
-                f::Usage::CpuOnly(_) => gl::STREAM_DRAW,
+                Data => gl::STATIC_DRAW,
+                Dynamic => gl::DYNAMIC_DRAW,
+                Upload => gl::STREAM_DRAW,
+                Download => gl::STREAM_READ,
             };
             unsafe {
                 gl.BindBuffer(target, buffer);
                 gl.BufferData(target,
                     info.size as gl::types::GLsizeiptr,
-                    0 as *const gl::types::GLvoid,
+                    data_ptr,
                     usage
                 );
             }
         }
+        if let Err(err) = self.share.check() {
+            panic!("Error {:?} creating buffer: {:?}", err, info)
+        }
+
+        let mapping_access = match info.usage {
+            Data | Dynamic => None,
+            Upload => Some(memory::WRITE),
+            Download => Some(memory::READ),
+        };
+
+        mapping_access.map(|access| {
+            let (kind, ptr) = if self.share.private_caps.buffer_storage_supported {
+                let gl_access = access_to_map_bits(access) |
+                                gl::MAP_PERSISTENT_BIT |
+                                gl::MAP_FLUSH_EXPLICIT_BIT;
+                let size = info.size as isize;
+                let ptr = unsafe {
+                    gl.BindBuffer(target, buffer);
+                    gl.MapBufferRange(target, 0, size, gl_access)
+                } as *mut ::std::os::raw::c_void;
+                (MappingKind::Persistent(mapping::Status::clean()), ptr)
+            } else {
+                (MappingKind::Temporary, ptr::null_mut())
+            };
+            if let Err(err) = self.share.check() {
+                panic!("Error {:?} mapping buffer: {:?}, with access: {:?}",
+                       err, info, access)
+            }
+
+            MappingGate {
+                kind: kind,
+                pointer: ptr,
+            }
+        })
     }
 
     fn create_program_raw(&mut self, shader_set: &d::ShaderSet<R>)
-                              -> Result<(gl::types::GLuint, d::shade::ProgramInfo), d::shade::CreateProgramError> {
+                          -> Result<(gl::types::GLuint, d::shade::ProgramInfo), d::shade::CreateProgramError> {
         use shade::create_program;
         let frame_handles = &mut self.frame_handles;
-        let mut shaders = [0; 3];
+        let mut shaders = [0; 5];
         let usage = shader_set.get_usage();
         let shader_slice = match shader_set {
             &d::ShaderSet::Simple(ref vs, ref ps) => {
@@ -151,9 +219,20 @@ impl Factory {
                 shaders[2] = *ps.reference(frame_handles);
                 &shaders[..3]
             },
+            &d::ShaderSet::Tessellated(ref vs, ref hs, ref ds, ref ps) => {
+                shaders[0] = *vs.reference(frame_handles);
+                shaders[1] = *hs.reference(frame_handles);
+                shaders[2] = *ds.reference(frame_handles);
+                shaders[3] = *ps.reference(frame_handles);
+                &shaders[..4]
+            },
         };
-        create_program(&self.share.context, &self.share.capabilities,
-                       &self.share.private_caps, shader_slice, usage)
+        let result = create_program(&self.share.context, &self.share.capabilities,
+                                    &self.share.private_caps, shader_slice, usage);
+        if let Err(err) = self.share.check() {
+            panic!("Error {:?} creating program: {:?}", err, shader_set)
+        }
+        result
     }
 
     fn view_texture_as_target(&mut self, htex: &handle::RawTexture<R>, level: Level, layer: Option<Layer>)
@@ -168,58 +247,91 @@ impl Factory {
     }
 }
 
-
-#[derive(Copy, Clone)]
-pub struct RawMapping {
-    pointer: *mut ::std::os::raw::c_void,
-    target: gl::types::GLenum,
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum MappingKind {
+    Persistent(mapping::Status<R>),
+    Temporary,
 }
 
-impl d::mapping::Raw for RawMapping {
+#[derive(Debug, Eq, Hash, PartialEq)]
+#[allow(missing_copy_implementations)]
+pub struct MappingGate {
+    pub kind: MappingKind,
+    pub pointer: *mut ::std::os::raw::c_void,
+}
+
+unsafe impl Send for MappingGate {}
+unsafe impl Sync for MappingGate {}
+
+impl mapping::Gate<R> for MappingGate {
     unsafe fn set<T>(&self, index: usize, val: T) {
         *(self.pointer as *mut T).offset(index as isize) = val;
     }
 
-    unsafe fn to_slice<T>(&self, len: usize) -> &[T] {
+    unsafe fn slice<'a, 'b, T>(&'a self, len: usize) -> &'b [T] {
         slice::from_raw_parts(self.pointer as *const T, len)
     }
 
-    unsafe fn to_mut_slice<T>(&self, len: usize) -> &mut [T] {
+    unsafe fn mut_slice<'a, 'b, T>(&'a self, len: usize) -> &'b mut [T] {
         slice::from_raw_parts_mut(self.pointer as *mut T, len)
     }
 }
 
+pub fn temporary_ensure_mapped(pointer: &mut *mut ::std::os::raw::c_void,
+                               target: gl::types::GLenum,
+                               buffer: Buffer,
+                               access: memory::Access,
+                               gl: &gl::Gl) {
+    if pointer.is_null() {
+        unsafe {
+            gl.BindBuffer(target, buffer);
+            *pointer = gl.MapBuffer(target, access_to_gl(access))
+                as *mut ::std::os::raw::c_void;
+        }
+    }
+}
 
-impl d::Factory<R> for Factory {
-    type Mapper = RawMapping;
+pub fn temporary_ensure_unmapped(pointer: &mut *mut ::std::os::raw::c_void,
+                                 target: gl::types::GLenum,
+                                 buffer: Buffer,
+                                 gl: &gl::Gl) {
+    if !pointer.is_null() {
+        unsafe {
+            gl.BindBuffer(target, buffer);
+            gl.UnmapBuffer(target);
+        }
 
+        *pointer = ptr::null_mut();
+    }
+}
+
+impl f::Factory<R> for Factory {
     fn get_capabilities(&self) -> &d::Capabilities {
         &self.share.capabilities
     }
 
-    fn create_buffer_raw(&mut self, info: f::BufferInfo) -> Result<handle::RawBuffer<R>, f::BufferError> {
-        if !self.share.capabilities.constant_buffer_supported && info.role == f::BufferRole::Uniform {
+    fn create_buffer_raw(&mut self, info: buffer::Info) -> Result<handle::RawBuffer<R>, buffer::CreationError> {
+        if !self.share.capabilities.constant_buffer_supported && info.role == buffer::Role::Constant {
             error!("Constant buffers are not supported by this GL version");
-            return Err(f::BufferError::Other);
+            return Err(buffer::CreationError::Other);
         }
         let name = self.create_buffer_internal();
-        self.init_buffer(name, &info);
-        Ok(self.share.handles.borrow_mut().make_buffer(name, info))
+        let mapping = self.init_buffer(name, &info, None);
+        Ok(self.share.handles.borrow_mut().make_buffer(name, info, mapping))
     }
 
-    fn create_buffer_const_raw(&mut self, data: &[u8], stride: usize, role: f::BufferRole, bind: f::Bind)
-                               -> Result<handle::RawBuffer<R>, f::BufferError> {
+    fn create_buffer_immutable_raw(&mut self, data: &[u8], stride: usize, role: buffer::Role, bind: Bind)
+                               -> Result<handle::RawBuffer<R>, buffer::CreationError> {
         let name = self.create_buffer_internal();
-        let info = f::BufferInfo {
+        let info = buffer::Info {
             role: role,
-            usage: f::Usage::Const,
+            usage: memory::Usage::Data,
             bind: bind,
             size: data.len(),
             stride: stride,
         };
-        self.init_buffer(name, &info);
-        update_sub_buffer(&self.share.context, name, data.as_ptr(), data.len(), 0, role);
-        Ok(self.share.handles.borrow_mut().make_buffer(name, info))
+        let mapping = self.init_buffer(name, &info, Some(data));
+        Ok(self.share.handles.borrow_mut().make_buffer(name, info, mapping))
     }
 
     fn create_shader(&mut self, stage: d::shade::Stage, code: &[u8])
@@ -236,7 +348,13 @@ impl d::Factory<R> for Factory {
 
     fn create_pipeline_state_raw(&mut self, program: &handle::Program<R>, desc: &d::pso::Descriptor)
                                  -> Result<handle::RawPipelineState<R>, d::pso::CreationError> {
-        use gfx_core::state as s;
+        use core::state as s;
+        let caps = &self.share.capabilities;
+        match desc.primitive {
+            d::Primitive::PatchList(num) if num == 0 || (num as usize) > caps.max_patch_size =>
+                return Err(d::pso::CreationError),
+            _ => ()
+        }
         let mut output = OutputMerger {
             draw_mask: 0,
             stencil: match desc.depth_stencil {
@@ -261,10 +379,17 @@ impl d::Factory<R> for Factory {
                 }
             }
         }
+        let mut inputs = [None; d::MAX_VERTEX_ATTRIBUTES];
+        for i in 0 .. d::MAX_VERTEX_ATTRIBUTES {
+            inputs[i] = desc.attributes[i].map(|at| BufferElement {
+                desc: desc.vertex_buffers[at.0 as usize].unwrap(),
+                elem: at.1,
+            });
+        }
         let pso = PipelineState {
             program: *self.frame_handles.ref_program(program),
             primitive: desc.primitive,
-            input: desc.attributes,
+            input: inputs,
             scissor: desc.scissor,
             rasterizer: desc.rasterizer,
             output: output,
@@ -272,24 +397,24 @@ impl d::Factory<R> for Factory {
         Ok(self.share.handles.borrow_mut().make_pso(pso, program))
     }
 
-    fn create_texture_raw(&mut self, desc: t::Descriptor, hint: Option<ChannelType>, data_opt: Option<&[&[u8]]>)
-                          -> Result<handle::RawTexture<R>, t::Error> {
-        use gfx_core::tex::Error;
+    fn create_texture_raw(&mut self, desc: t::Info, hint: Option<ChannelType>, data_opt: Option<&[&[u8]]>)
+                          -> Result<handle::RawTexture<R>, t::CreationError> {
+        use core::texture::CreationError;
         let caps = &self.share.private_caps;
         if desc.levels == 0 {
-            return Err(Error::Size(0))
+            return Err(CreationError::Size(0))
         }
         let dim = desc.kind.get_dimensions();
         let max_size = self.share.capabilities.max_texture_size;
         if dim.0 as usize > max_size {
-            return Err(Error::Size(dim.0));
+            return Err(CreationError::Size(dim.0));
         }
         if dim.1 as usize > max_size {
-            return Err(Error::Size(dim.1));
+            return Err(CreationError::Size(dim.1));
         }
         let cty = hint.unwrap_or(ChannelType::Uint); //careful here
         let gl = &self.share.context;
-        let object = if desc.bind.intersects(f::SHADER_RESOURCE | f::UNORDERED_ACCESS) || data_opt.is_some() {
+        let object = if desc.bind.intersects(SHADER_RESOURCE | UNORDERED_ACCESS) || data_opt.is_some() {
             let name = if caps.immutable_storage_supported {
                 try!(tex::make_with_storage(gl, &desc, cty))
             } else {
@@ -303,6 +428,9 @@ impl d::Factory<R> for Factory {
             let name = try!(tex::make_surface(gl, &desc, cty));
             NewTexture::Surface(name)
         };
+        if let Err(err) = self.share.check() {
+            panic!("Error {:?} creating texture: {:?}, hint: {:?}", err, desc, hint)
+        }
         Ok(self.share.handles.borrow_mut().make_texture(object, desc))
     }
 
@@ -318,6 +446,9 @@ impl d::Factory<R> for Factory {
             gl.TexBuffer(gl::TEXTURE_BUFFER, format, buf_name);
         }
         let view = ResourceView::new_buffer(name);
+        if let Err(err) = self.share.check() {
+            panic!("Error {:?} creating buffer SRV: {:?}", err, hbuf.get_info())
+        }
         Ok(self.share.handles.borrow_mut().make_buffer_srv(view, hbuf))
     }
 
@@ -371,45 +502,63 @@ impl d::Factory<R> for Factory {
             object: name,
             info: info.clone(),
         };
+        if let Err(err) = self.share.check() {
+            panic!("Error {:?} creating sampler: {:?}", err, info)
+        }
         self.share.handles.borrow_mut().make_sampler(sam, info)
     }
 
-    fn map_buffer_raw(&mut self, buf: &handle::RawBuffer<R>,
-                      access: f::MapAccess) -> RawMapping {
+    fn read_mapping<'a, 'b, T>(&'a mut self, buf: &'b handle::Buffer<R, T>)
+                               -> Result<mapping::Reader<'b, R, T>,
+                                         mapping::Error>
+        where T: Copy
+    {
         let gl = &self.share.context;
-        let raw_handle = *self.frame_handles.ref_buffer(buf);
-        unsafe { gl.BindBuffer(gl::ARRAY_BUFFER, raw_handle) };
-        let ptr = unsafe { gl.MapBuffer(gl::ARRAY_BUFFER, match access {
-            f::MapAccess::Readable => gl::READ_ONLY,
-            f::MapAccess::Writable => gl::WRITE_ONLY,
-            f::MapAccess::RW => gl::READ_WRITE
-        }) } as *mut ::std::os::raw::c_void;
-        RawMapping {
-            pointer: ptr,
-            target: gl::ARRAY_BUFFER
+        let handles = &mut self.frame_handles;
+        unsafe {
+            mapping::read(buf.raw(), |mapping| match mapping.kind {
+                MappingKind::Persistent(ref mut status) =>
+                    status.cpu_access(|fence| wait_fence(&handles.ref_fence(&fence), gl)),
+                MappingKind::Temporary =>
+                    temporary_ensure_mapped(&mut mapping.pointer,
+                                            role_to_target(buf.get_info().role),
+                                            *buf.raw().resource(),
+                                            memory::READ,
+                                            gl),
+            })
         }
     }
 
-    fn unmap_buffer_raw(&mut self, map: RawMapping) {
+    fn write_mapping<'a, 'b, T>(&'a mut self, buf: &'b handle::Buffer<R, T>)
+                                -> Result<mapping::Writer<'b, R, T>,
+                                          mapping::Error>
+        where T: Copy
+    {
         let gl = &self.share.context;
-        unsafe { gl.UnmapBuffer(map.target) };
+        let handles = &mut self.frame_handles;
+        unsafe {
+            mapping::write(buf.raw(), |mapping| match mapping.kind {
+                MappingKind::Persistent(ref mut status) =>
+                    status.cpu_write_access(|fence| wait_fence(&handles.ref_fence(&fence), gl)),
+                MappingKind::Temporary =>
+                    temporary_ensure_mapped(&mut mapping.pointer,
+                                            role_to_target(buf.get_info().role),
+                                            *buf.raw().resource(),
+                                            memory::WRITE,
+                                            gl),
+            })
+        }
     }
+}
 
-    fn map_buffer_readable<T: Copy>(&mut self, buf: &handle::Buffer<R, T>)
-                           -> d::mapping::Readable<T, R, Factory> {
-        let map = self.map_buffer_raw(buf.raw(), f::MapAccess::Readable);
-        self.map_readable(map, buf.len())
-    }
-
-    fn map_buffer_writable<T: Copy>(&mut self, buf: &handle::Buffer<R, T>)
-                                    -> d::mapping::Writable<T, R, Factory> {
-        let map = self.map_buffer_raw(buf.raw(), f::MapAccess::Writable);
-        self.map_writable(map, buf.len())
-    }
-
-    fn map_buffer_rw<T: Copy>(&mut self, buf: &handle::Buffer<R, T>)
-                              -> d::mapping::RW<T, R, Factory> {
-        let map = self.map_buffer_raw(buf.raw(), f::MapAccess::RW);
-        self.map_read_write(map, buf.len())
+pub fn wait_fence(fence: &Fence, gl: &gl::Gl) {
+    let timeout = 1_000_000_000_000;
+    // TODO: use the return value of this call
+    // TODO:
+    // This can be called by multiple objects wanting to ensure they have exclusive
+    // access to a resource. How much does this call costs ? The status of the fence
+    // could be cached to avoid calling this more than once (in core or in the backend ?).
+    unsafe {
+        gl.ClientWaitSync(fence.0, gl::SYNC_FLUSH_COMMANDS_BIT, timeout);
     }
 }

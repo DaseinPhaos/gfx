@@ -19,6 +19,7 @@ extern crate gfx_app;
 extern crate rand;
 extern crate genmesh;
 extern crate noise;
+extern crate winit;
 
 use rand::Rng;
 use cgmath::{SquareMatrix, Matrix4, Point3, Vector3};
@@ -74,7 +75,8 @@ struct App<R: gfx::Resources> {
 }
 
 impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
-    fn new<F: gfx::Factory<R>>(mut factory: F, init: gfx_app::Init<R>) -> Self {
+    fn new<F: gfx::Factory<R>>(factory: &mut F, backend: gfx_app::shade::Backend,
+           window_targets: gfx_app::WindowTargets<R>) -> Self {
         use gfx::traits::FactoryExt;
 
         let vs = gfx_app::shade::Source {
@@ -82,6 +84,7 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             glsl_150: include_bytes!("shader/terrain_150.glslv"),
             hlsl_40:  include_bytes!("data/vertex.fx"),
             msl_11: include_bytes!("shader/terrain_vertex.metal"),
+            vulkan:   include_bytes!("data/vert.spv"),
             .. gfx_app::shade::Source::empty()
         };
         let ps = gfx_app::shade::Source {
@@ -89,6 +92,7 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             glsl_150: include_bytes!("shader/terrain_150.glslf"),
             hlsl_40:  include_bytes!("data/pixel.fx"),
             msl_11: include_bytes!("shader/terrain_frag.metal"),
+            vulkan:   include_bytes!("data/frag.spv"),
             .. gfx_app::shade::Source::empty()
         };
 
@@ -115,8 +119,8 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
 
         App {
             pso: factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap(),
                 pipe::new()
                 ).unwrap(),
             data: pipe::Data {
@@ -125,10 +129,10 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
                 model: Matrix4::identity().into(),
                 view: Matrix4::identity().into(),
                 proj: cgmath::perspective(
-                    cgmath::deg(60.0f32), init.aspect_ratio, 0.1, 1000.0
+                    cgmath::deg(60.0f32), window_targets.aspect_ratio, 0.1, 1000.0
                     ).into(),
-                out_color: init.color,
-                out_depth: init.depth,
+                out_color: window_targets.color,
+                out_depth: window_targets.depth,
             },
             slice: slice,
             start_time: Instant::now(),
@@ -158,9 +162,17 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         encoder.clear_depth(&self.data.out_depth, 1.0);
         encoder.draw(&self.slice, &self.pso, &self.data);
     }
+
+    fn on_resize(&mut self, window_targets: gfx_app::WindowTargets<R>) {
+        self.data.out_color = window_targets.color;
+        self.data.out_depth = window_targets.depth;
+        self.data.proj = cgmath::perspective(
+            cgmath::deg(60.0f32), window_targets.aspect_ratio, 0.1, 1000.0
+            ).into();
+    }
 }
 
 pub fn main() {
     use gfx_app::Application;
-    App::launch_default("Terrain example");
+    App::launch_simple("Terrain example");
 }

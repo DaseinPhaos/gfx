@@ -16,40 +16,40 @@
 
 #![allow(missing_docs)]
 
-use std::fmt;
+use std::{fmt, cmp, hash};
 use std::error::Error;
-use {AttributeSlot, ColorSlot, ConstantBufferSlot, ResourceViewSlot,
-     SamplerSlot, UnorderedViewSlot};
+use {Resources};
+use {AttributeSlot, ColorSlot, ConstantBufferSlot, ResourceViewSlot, SamplerSlot, UnorderedViewSlot};
 
 /// Number of components in a container type (vectors/matrices)
 pub type Dimension = u8;
 
 /// Whether the sampler samples an array texture.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum IsArray { Array, NoArray }
 
 /// Whether the sampler compares the depth value upon sampling.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum IsComparison { Compare, NoCompare }
 
 /// Whether the sampler samples a multisample texture.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum IsMultiSample { MultiSample, NoMultiSample }
 
 /// Whether the sampler samples a rectangle texture.
 ///
 /// Rectangle textures are the same as 2D textures, but accessed with absolute texture coordinates
 /// (as opposed to the usual, normalized to [0, 1]).
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum IsRect { Rect, NoRect }
 
 /// Whether the matrix is column or row major.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum MatrixFormat { ColumnMajor, RowMajor }
 
 /// A type of the texture variable.
 /// This has to match the actual data we bind to the shader.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TextureType {
     /// Sample from a buffer.
     Buffer,
@@ -83,7 +83,7 @@ pub struct SamplerType(pub IsComparison, pub IsRect);
 
 /// Base type of this shader parameter.
 #[allow(missing_docs)]
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum BaseType {
     I32,
     U32,
@@ -93,7 +93,7 @@ pub enum BaseType {
 }
 
 /// Number of components this parameter represents.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ContainerType {
     /// Scalar value
     Single,
@@ -107,16 +107,18 @@ pub enum ContainerType {
 
 /// Which program stage this shader represents.
 #[allow(missing_docs)]
-#[derive(Copy, Clone, Debug, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Stage {
     Vertex,
+    Hull,
+    Domain,
     Geometry,
     Pixel,
 }
 
 /// A constant static array of all shader stages.
-pub const STAGES: [Stage; 3] = [Stage::Vertex, Stage::Geometry, Stage::Pixel];
+pub const STAGES: [Stage; 5] = [Stage::Vertex, Stage::Hull, Stage::Domain, Stage::Geometry, Stage::Pixel];
 
 // Describing program data
 
@@ -260,6 +262,11 @@ bitflags!(
         const GEOMETRY = 0x2,
         /// Used by the pixel shader
         const PIXEL    = 0x4,
+        /// Used by the hull shader
+        const HULL    = 0x8,
+        /// Used by the pixel shader
+        const DOMAIN    = 0x16,
+
     }
 );
 
@@ -269,6 +276,8 @@ impl From<Stage> for Usage {
             Stage::Vertex => VERTEX,
             Stage::Geometry => GEOMETRY,
             Stage::Pixel => PIXEL,
+            Stage::Hull => HULL,
+            Stage::Domain => DOMAIN,
         }
     }
 }
@@ -293,6 +302,7 @@ pub struct ConstVar {
     /// Name of this constant.
     pub name: String,
     /// Location of this constant in the program.
+    /// For constant buffer elements, it's the offset in bytes.
     pub location: Location,
     /// Number of elements this constant represents.
     pub count: usize,
@@ -313,6 +323,8 @@ pub struct ConstantBufferVar {
     pub size: usize,
     /// What program stage this buffer is used in.
     pub usage: Usage,
+    /// List of individual elements in this buffer.
+    pub elements: Vec<ConstVar>,
 }
 
 /// Texture shader parameter.
@@ -389,6 +401,43 @@ pub struct ProgramInfo {
     /// A hacky flag to make sure the clients know we are
     /// unable to actually get the output variable info
     pub knows_outputs: bool,
+}
+
+/// A program
+#[derive(Debug)]
+pub struct Program<R: Resources> {
+    resource: R::Program,
+    info: ProgramInfo,
+}
+
+impl<R: Resources> Program<R> {
+    #[doc(hidden)]
+    pub fn new(resource: R::Program, info: ProgramInfo) -> Self {
+        Program {
+            resource: resource,
+            info: info,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn resource(&self) -> &R::Program { &self.resource }
+
+    /// Get program info
+    pub fn get_info(&self) -> &ProgramInfo { &self.info }
+}
+
+impl<R: Resources + cmp::PartialEq> cmp::PartialEq for Program<R> {
+    fn eq(&self, other: &Program<R>) -> bool {
+        self.resource().eq(other.resource())
+    }
+}
+
+impl<R: Resources + cmp::Eq> cmp::Eq for Program<R> {}
+
+impl<R: Resources + hash::Hash> hash::Hash for Program<R> {
+    fn hash<H>(&self, state: &mut H) where H: hash::Hasher {
+        self.resource().hash(state);
+    }
 }
 
 /// Error type for trying to store a UniformValue in a ConstVar.
@@ -486,4 +535,23 @@ impl Error for CreateShaderError {
 }
 
 /// An error type for creating programs.
-pub type CreateProgramError = String;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateProgramError(String);
+
+impl fmt::Display for CreateProgramError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad(&self.0)
+    }
+}
+
+impl Error for CreateProgramError {
+    fn description(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<S: Into<String>> From<S> for CreateProgramError {
+    fn from(s: S) -> CreateProgramError {
+        CreateProgramError(s.into())
+    }
+}

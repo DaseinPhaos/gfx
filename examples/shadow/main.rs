@@ -16,14 +16,15 @@ extern crate cgmath;
 #[macro_use]
 extern crate gfx;
 extern crate gfx_app;
+extern crate winit;
 
 use std::sync::{Arc, RwLock};
 pub use gfx::format::{DepthStencil};
 pub use gfx_app::{ColorFormat, DepthFormat};
 
-#[cfg(target_os="macos")]
+#[cfg(feature="metal")]
 pub use gfx::format::Depth32F as Depth;
-#[cfg(not(target_os="macos"))]
+#[cfg(not(feature="metal"))]
 pub use gfx::format::Depth;
 
 // Section-1: vertex formats and shader parameters
@@ -149,7 +150,12 @@ fn create_plane<R: gfx::Resources, F: gfx::Factory<R>>(factory: &mut F, size: i8
         Vertex::new([-size,  size,  0], [0, 0, 1]),
     ];
 
-    factory.create_vertex_buffer_with_slice(&vertex_data, ())
+    let index_data: &[u16] = &[
+        0, 1, 2,
+        2, 1, 3
+    ];
+
+    factory.create_vertex_buffer_with_slice(&vertex_data, index_data)
 }
 
 //----------------------------------------
@@ -194,33 +200,33 @@ struct Scene<R: gfx::Resources, C: gfx::CommandBuffer<R>> {
 // Section-4: scene construction routines
 
 /// Create a full scene
-fn create_scene<R, F, C>(factory: &mut F, encoder: &gfx::Encoder<R, C>,
+fn create_scene<R, F>(factory: &mut F,
                 out_color: gfx::handle::RenderTargetView<R, ColorFormat>,
                 out_depth: gfx::handle::DepthStencilView<R, DepthFormat>,
                 shadow_pso: gfx::PipelineState<R, shadow::Meta>)
-                -> Scene<R, C> where
+                -> Scene<R, F::CommandBuffer> where
     R: gfx::Resources,
-    F: gfx::Factory<R>,
-    C: gfx::CommandBuffer<R>,
+    F: gfx_app::Factory<R>,
 {
     use cgmath::{SquareMatrix, Matrix4, deg};
     use gfx::traits::FactoryExt;
 
     // create shadows
     let (shadow_tex, shadow_resource) = {
-        use gfx::tex as t;
+        use gfx::texture as t;
         let kind = t::Kind::D2Array(512, 512, MAX_LIGHTS as gfx::Layer, t::AaMode::Single);
         let bind = gfx::SHADER_RESOURCE | gfx::DEPTH_STENCIL;
         let cty = gfx::format::ChannelType::Unorm;
-        let tex = factory.create_texture(kind, 1, bind, gfx::Usage::GpuOnly, Some(cty)).unwrap();
+        let tex = factory.create_texture(kind, 1, bind, gfx::memory::Usage::Data, Some(cty)).unwrap();
         let resource = factory.view_texture_as_shader_resource::<Depth>(
             &tex, (0, 0), gfx::format::Swizzle::new()).unwrap();
         (tex, resource)
     };
     let shadow_sampler = {
-        let mut sinfo = gfx::tex::SamplerInfo::new(
-            gfx::tex::FilterMethod::Bilinear,
-            gfx::tex::WrapMode::Clamp
+        use gfx::texture as t;
+        let mut sinfo = t::SamplerInfo::new(
+            t::FilterMethod::Bilinear,
+            t::WrapMode::Clamp
         );
         sinfo.comparison = Some(gfx::state::Comparison::LessEqual);
         factory.create_sampler(sinfo)
@@ -262,9 +268,9 @@ fn create_scene<R, F, C>(factory: &mut F, encoder: &gfx::Encoder<R, C>,
         }.to_perspective(),
         color: desc.color.clone(),
         shadow: factory.view_texture_as_depth_stencil(
-            &shadow_tex, 0, Some(i as gfx::Layer), gfx::tex::DepthStencilFlags::empty(),
+            &shadow_tex, 0, Some(i as gfx::Layer), gfx::texture::DepthStencilFlags::empty(),
             ).unwrap(),
-        encoder: encoder.clone_empty(),
+        encoder: factory.create_encoder(),
     }).collect();
     let light_buf = factory.create_constant_buffer(MAX_LIGHTS);
 
@@ -308,8 +314,8 @@ fn create_scene<R, F, C>(factory: &mut F, encoder: &gfx::Encoder<R, C>,
     let mut fw_data = forward::Data {
         vbuf: cube_buf.clone(),
         vs_locals: factory.create_constant_buffer(1),
-        ps_locals: factory.create_buffer_const(&[locals],
-            gfx::BufferRole::Uniform, gfx::Bind::empty()
+        ps_locals: factory.create_buffer_immutable(&[locals],
+            gfx::buffer::Role::Constant, gfx::Bind::empty()
             ).unwrap(),
         light_buf: light_buf.clone(),
         shadow: (shadow_resource, shadow_sampler),
@@ -322,7 +328,7 @@ fn create_scene<R, F, C>(factory: &mut F, encoder: &gfx::Encoder<R, C>,
         locals: factory.create_constant_buffer(1),
         // the output here is temporary, will be overwritten for every light source
         out: factory.view_texture_as_depth_stencil(&shadow_tex, 0, None,
-            gfx::tex::DepthStencilFlags::empty()).unwrap(),
+            gfx::texture::DepthStencilFlags::empty()).unwrap(),
     };
 
     let mut entities: Vec<_> = cube_descs.iter().map(|desc| {
@@ -389,7 +395,7 @@ fn create_scene<R, F, C>(factory: &mut F, encoder: &gfx::Encoder<R, C>,
 // Section-5: application
 
 struct App<R: gfx::Resources, C: gfx::CommandBuffer<R>> {
-    init: gfx_app::Init<R>,
+    window_targets: gfx_app::WindowTargets<R>,
     is_parallel: bool,
     forward_pso: gfx::PipelineState<R, forward::Meta>,
     encoder: gfx::Encoder<R, C>,
@@ -424,8 +430,8 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
     R: gfx::Resources + 'static,
     C: gfx::CommandBuffer<R> + Send + 'static,
 {
-    fn new<F>(mut factory: F, encoder: gfx::Encoder<R, C>, init: gfx_app::Init<R>) -> Self where
-        F: gfx::Factory<R>
+    fn new<F>(factory: &mut F, backend: gfx_app::shade::Backend, window_targets: gfx_app::WindowTargets<R>) -> Self
+    where F: gfx_app::Factory<R, CommandBuffer=C>,
     {
         use std::env;
         use gfx::traits::FactoryExt;
@@ -455,8 +461,8 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
                 .. Source::empty()
             };
             factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap(),
                 forward::new()
                 ).unwrap()
         };
@@ -475,8 +481,8 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
                 .. Source::empty()
             };
             let set = factory.create_shader_set(
-                vs.select(init.backend).unwrap(),
-                ps.select(init.backend).unwrap()
+                vs.select(backend).unwrap(),
+                ps.select(backend).unwrap()
                 ).unwrap();
             factory.create_pipeline_state(&set,
                 gfx::Primitive::TriangleList,
@@ -487,15 +493,16 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
                 ).unwrap()
         };
 
-        let scene = create_scene(&mut factory, &encoder,
-            init.color.clone(), init.depth.clone(),
+        let scene = create_scene(factory,
+            window_targets.color.clone(),
+            window_targets.depth.clone(),
             shadow_pso);
 
         App {
-            init: init,
+            window_targets: window_targets,
             is_parallel: is_parallel,
             forward_pso: forward_pso,
-            encoder: encoder,
+            encoder: factory.create_encoder(),
             scene: scene,
         }
     }
@@ -510,9 +517,7 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
                 pos: [light.position.x, light.position.y, light.position.z, 1.0],
                 color: light.color,
                 proj: {
-                    use cgmath::Matrix4;
-
-                    let mx_proj: Matrix4<_> = light.projection.into();
+                    let mx_proj = cgmath::Matrix4::from(light.projection);
                     (mx_proj * light.mx_view).into()
                 },
             }).collect();
@@ -586,12 +591,12 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
         }
 
         // draw entities with forward pass
-        self.encoder.clear(&self.init.color, [0.1, 0.2, 0.3, 1.0]);
-        self.encoder.clear_depth(&self.init.depth, 1.0);
+        self.encoder.clear(&self.window_targets.color, [0.1, 0.2, 0.3, 1.0]);
+        self.encoder.clear_depth(&self.window_targets.depth, 1.0);
 
         let mx_vp = {
             let mut proj = self.scene.camera.projection;
-            proj.aspect = self.init.aspect_ratio;
+            proj.aspect = self.window_targets.aspect_ratio;
             let mx_proj: cgmath::Matrix4<_> = proj.into();
             mx_proj * self.scene.camera.mx_view
         };
@@ -608,13 +613,33 @@ impl<R, C> gfx_app::ApplicationBase<R, C> for App<R, C> where
 
         self.encoder.flush(device);
     }
+
+    fn get_exit_key() -> Option<winit::VirtualKeyCode> {
+        Some(winit::VirtualKeyCode::Escape)
+    }
+
+    fn on(&mut self, event: winit::Event) {
+        match event {
+            _ => () //TODO
+        }
+    }
+
+    fn on_resize<F>(&mut self, _factory: &mut F, window_targets: gfx_app::WindowTargets<R>)
+    where F: gfx_app::Factory<R, CommandBuffer=C>
+    {
+        for ent in self.scene.share.write().unwrap().entities.iter_mut() {
+            ent.batch_forward.out_color = window_targets.color.clone();
+            ent.batch_forward.out_depth = window_targets.depth.clone();
+        }
+        self.window_targets = window_targets;
+    }
 }
 
 //----------------------------------------
 // Section-6: main entry point
 
 pub fn main() {
-    <App<_, _> as gfx_app::ApplicationGL>::launch(
-        "Multi-threaded shadow rendering example with gfx-rs",
-        gfx_app::DEFAULT_CONFIG);
+    let wb = winit::WindowBuilder::new().with_title(
+        "Multi-threaded shadow rendering example with gfx-rs");
+    gfx_app::launch_gl3::<App<_, _>>(wb);
 }

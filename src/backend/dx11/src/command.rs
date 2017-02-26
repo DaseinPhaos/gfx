@@ -19,11 +19,11 @@ use winapi::{FLOAT, INT, UINT, UINT8, DXGI_FORMAT,
              DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT,
              D3D11_CLEAR_FLAG, D3D11_PRIMITIVE_TOPOLOGY, D3D11_VIEWPORT, D3D11_RECT,
              ID3D11RasterizerState, ID3D11DepthStencilState, ID3D11BlendState};
-use gfx_core::{draw, pso, shade, state, target, tex};
-use gfx_core::{IndexType, VertexCount};
-use gfx_core::{MAX_VERTEX_ATTRIBUTES, MAX_CONSTANT_BUFFERS,
-               MAX_RESOURCE_VIEWS, MAX_UNORDERED_VIEWS,
-               MAX_SAMPLERS, MAX_COLOR_TARGETS};
+use core::{command, pso, shade, state, target, texture as tex};
+use core::{IndexType, VertexCount};
+use core::{MAX_VERTEX_ATTRIBUTES, MAX_CONSTANT_BUFFERS,
+           MAX_RESOURCE_VIEWS, MAX_UNORDERED_VIEWS,
+           MAX_SAMPLERS, MAX_COLOR_TARGETS};
 use {native, Resources, InputLayout, Buffer, Texture, Pipeline, Program};
 
 /// The place of some data in the data buffer.
@@ -75,6 +75,7 @@ pub enum Command {
     SetRasterizer(*const ID3D11RasterizerState),
     SetDepthStencil(*const ID3D11DepthStencilState, UINT),
     SetBlend(*const ID3D11BlendState, [FLOAT; 4], UINT),
+    CopyBuffer(Buffer, Buffer, UINT, UINT, UINT),
     // resource updates
     UpdateBuffer(Buffer, DataPointer, usize),
     UpdateTexture(Texture, tex::Kind, Option<tex::CubeFace>, DataPointer, tex::RawImageInfo),
@@ -91,7 +92,7 @@ pub enum Command {
 unsafe impl Send for Command {}
 
 struct Cache {
-    attributes: [Option<pso::AttributeDesc>; MAX_VERTEX_ATTRIBUTES],
+    attrib_strides: [Option<pso::ElemStride>; MAX_VERTEX_ATTRIBUTES],
     rasterizer: *const ID3D11RasterizerState,
     depth_stencil: *const ID3D11DepthStencilState,
     stencil_ref: UINT,
@@ -103,7 +104,7 @@ unsafe impl Send for Cache {}
 impl Cache {
     fn new() -> Cache {
         Cache {
-            attributes: [None; MAX_VERTEX_ATTRIBUTES],
+            attrib_strides: [None; MAX_VERTEX_ATTRIBUTES],
             rasterizer: ptr::null(),
             depth_stencil: ptr::null(),
             stencil_ref: 0,
@@ -118,8 +119,7 @@ pub struct CommandBuffer<P> {
     cache: Cache,
 }
 
-pub trait Parser: Sized {
-    fn clone_empty(&self) -> Self;
+pub trait Parser: Sized + Send {
     fn reset(&mut self);
     fn parse(&mut self, Command);
     fn update_buffer(&mut self, Buffer, &[u8], usize);
@@ -143,11 +143,7 @@ impl<P: Parser> CommandBuffer<P> {
     }
 }
 
-impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
-    fn clone_empty(&self) -> CommandBuffer<P> {
-        self.parser.clone_empty().into()
-    }
-
+impl<P: Parser> command::Buffer<Resources> for CommandBuffer<P> {
     fn reset(&mut self) {
         self.parser.reset();
         self.cache = Cache::new();
@@ -155,7 +151,15 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
 
     fn bind_pipeline_state(&mut self, pso: Pipeline) {
         self.parser.parse(Command::SetPrimitive(pso.topology));
-        self.cache.attributes = pso.attributes;
+        for (stride, ad_option) in self.cache.attrib_strides.iter_mut().zip(pso.attributes.iter()) {
+            *stride = ad_option.map(|(buf_id, _)| match pso.vertex_buffers[buf_id as usize] {
+                Some(ref bdesc) => bdesc.stride,
+                None => {
+                    error!("Unexpected use of buffer id {}", buf_id);
+                    0
+                },
+            });
+        }
         if self.cache.rasterizer != pso.rasterizer {
             self.cache.rasterizer = pso.rasterizer;
             self.parser.parse(Command::SetRasterizer(pso.rasterizer));
@@ -167,17 +171,18 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
     }
 
     fn bind_vertex_buffers(&mut self, vbs: pso::VertexBufferSet<Resources>) {
+        //Note: assumes `bind_pipeline_state` is called prior
         let mut buffers = [native::Buffer(ptr::null_mut()); MAX_VERTEX_ATTRIBUTES];
         let mut strides = [0; MAX_VERTEX_ATTRIBUTES];
         let mut offsets = [0; MAX_VERTEX_ATTRIBUTES];
         for i in 0 .. MAX_VERTEX_ATTRIBUTES {
-            match (vbs.0[i], self.cache.attributes[i]) {
-                (None, Some(fm)) => {
-                    error!("No vertex input provided for slot {} of format {:?}", i, fm)
+            match (vbs.0[i], self.cache.attrib_strides[i]) {
+                (None, Some(stride)) => {
+                    error!("No vertex input provided for slot {} with stride {}", i, stride)
                 },
-                (Some((buffer, offset)), Some(ref format)) => {
+                (Some((buffer, offset)), Some(stride)) => {
                     buffers[i] = buffer.0;
-                    strides[i] = format.0.stride as UINT;
+                    strides[i] = stride as UINT;
                     offsets[i] = offset as UINT;
                 },
                 (_, None) => (),
@@ -260,11 +265,17 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
                 error!("Depth and stencil views have to be the same");
             }
         }
+
+        let view = pts.get_view();
         let viewport = D3D11_VIEWPORT {
-            TopLeftX: 0.0, TopLeftY: 0.0,
-            Width: pts.size.0 as f32, Height: pts.size.1 as f32,
-            MinDepth: 0.0, MaxDepth: 1.0,
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: view.0 as f32,
+            Height: view.1 as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
         };
+
         let mut colors = [native::Rtv(ptr::null_mut()); MAX_COLOR_TARGETS];
         for i in 0 .. MAX_COLOR_TARGETS {
             if let Some(c) = pts.colors[i] {
@@ -302,6 +313,15 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
         self.cache.blend_ref = rv.blend;
     }
 
+    fn copy_buffer(&mut self, src: Buffer, dst: Buffer,
+                   src_offset_bytes: usize, dst_offset_bytes: usize,
+                   size_bytes: usize) {
+        self.parser.parse(Command::CopyBuffer(src, dst,
+                                              src_offset_bytes as UINT,
+                                              dst_offset_bytes as UINT,
+                                              size_bytes as UINT));
+    }
+
     fn update_buffer(&mut self, buf: Buffer, data: &[u8], offset: usize) {
         self.parser.update_buffer(buf, data, offset);
     }
@@ -315,9 +335,9 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
         self.parser.parse(Command::GenerateMips(srv));
     }
 
-    fn clear_color(&mut self, target: native::Rtv, value: draw::ClearColor) {
+    fn clear_color(&mut self, target: native::Rtv, value: command::ClearColor) {
         match value {
-            draw::ClearColor::Float(data) => {
+            command::ClearColor::Float(data) => {
                 self.parser.parse(Command::ClearColor(target, data));
             },
             _ => {
@@ -337,7 +357,7 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
         ));
     }
 
-    fn call_draw(&mut self, start: VertexCount, count: VertexCount, instances: draw::InstanceOption) {
+    fn call_draw(&mut self, start: VertexCount, count: VertexCount, instances: Option<command::InstanceParams>) {
         self.flush();
         self.parser.parse(match instances {
             Some((ninst, offset)) => Command::DrawInstanced(
@@ -347,7 +367,7 @@ impl<P: Parser> draw::CommandBuffer<Resources> for CommandBuffer<P> {
     }
 
     fn call_draw_indexed(&mut self, start: VertexCount, count: VertexCount,
-                         base: VertexCount, instances: draw::InstanceOption) {
+                         base: VertexCount, instances: Option<command::InstanceParams>) {
         self.flush();
         self.parser.parse(match instances {
             Some((ninst, offset)) => Command::DrawIndexedInstanced(

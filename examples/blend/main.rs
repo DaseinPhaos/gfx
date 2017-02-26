@@ -16,6 +16,7 @@
 extern crate gfx;
 extern crate gfx_app;
 extern crate image;
+extern crate winit;
 
 pub use gfx_app::ColorFormat;
 pub use gfx::format::{Rgba8, DepthStencil};
@@ -54,11 +55,11 @@ fn load_texture<R, F>(factory: &mut F, data: &[u8])
                 -> Result<gfx::handle::ShaderResourceView<R, [f32; 4]>, String> where
                 R: gfx::Resources, F: gfx::Factory<R> {
     use std::io::Cursor;
-    use gfx::tex as t;
+    use gfx::texture as t;
     let img = image::load(Cursor::new(data), image::PNG).unwrap().to_rgba();
     let (width, height) = img.dimensions();
     let kind = t::Kind::D2(width as t::Size, height as t::Size, t::AaMode::Single);
-    let (_, view) = factory.create_texture_const_u8::<Rgba8>(kind, &[&img]).unwrap();
+    let (_, view) = factory.create_texture_immutable_u8::<Rgba8>(kind, &[&img]).unwrap();
     Ok(view)
 }
 
@@ -80,7 +81,8 @@ struct App<R: gfx::Resources>{
 }
 
 impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
-    fn new<F: gfx::Factory<R>>(mut factory: F, init: gfx_app::Init<R>) -> Self {
+    fn new<F: gfx::Factory<R>>(factory: &mut F, backend: gfx_app::shade::Backend,
+           window_targets: gfx_app::WindowTargets<R>) -> Self {
         use gfx::traits::FactoryExt;
 
         let vs = gfx_app::shade::Source {
@@ -108,13 +110,13 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         ];
         let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, ());
 
-        let lena_texture = load_texture(&mut factory, &include_bytes!("image/lena.png")[..]).unwrap();
-        let tint_texture = load_texture(&mut factory, &include_bytes!("image/tint.png")[..]).unwrap();
+        let lena_texture = load_texture(factory, &include_bytes!("image/lena.png")[..]).unwrap();
+        let tint_texture = load_texture(factory, &include_bytes!("image/tint.png")[..]).unwrap();
         let sampler = factory.create_sampler_linear();
 
         let pso = factory.create_pipeline_simple(
-            vs.select(init.backend).unwrap(),
-            ps.select(init.backend).unwrap(),
+            vs.select(backend).unwrap(),
+            ps.select(backend).unwrap(),
             pipe::new()
         ).unwrap();
 
@@ -132,7 +134,7 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
             tint: (tint_texture, sampler),
             blend: 0,
             locals: cbuf,
-            out: init.color,
+            out: window_targets.color,
         };
 
         App {
@@ -141,24 +143,34 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         }
     }
 
-    //fn update() {
-    // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::B)) => {
-    //                let blend_func = blends_cycle.next().unwrap();
-    //                println!("Using '{}' blend equation", blend_func.1);
-    //                data.blend = blend_func.0;
-    //            },
-    //
-    //}
-
     fn render<C: gfx::CommandBuffer<R>>(&mut self, encoder: &mut gfx::Encoder<R, C>) {
+        self.bundle.data.blend = (self.id as i32).into();
         let locals = Locals { blend: self.id as i32 };
         encoder.update_constant_buffer(&self.bundle.data.locals, &locals);
         encoder.clear(&self.bundle.data.out, [0.0; 4]);
         self.bundle.encode(encoder);
     }
+
+    fn on(&mut self, event: winit::Event) {
+        match event {
+            winit::Event::KeyboardInput(winit::ElementState::Pressed, _, Some(winit::VirtualKeyCode::B)) => {
+                self.id += 1;
+                if self.id as usize >= BLENDS.len() {
+                    self.id = 0;
+                }
+                println!("Using '{}' blend equation", BLENDS[self.id as usize]);
+            },
+            _ => ()
+        }
+    }
+
+    fn on_resize(&mut self, window_targets: gfx_app::WindowTargets<R>) {
+        self.bundle.data.out = window_targets.color;
+    }
 }
 
 pub fn main() {
     use gfx_app::Application;
-    App::launch_default("Blending example");
+    let wb = winit::WindowBuilder::new().with_title("Blending example");
+    App::launch_default(wb);
 }

@@ -20,32 +20,28 @@ extern crate log;
 extern crate objc;
 extern crate cocoa;
 extern crate winit;
-extern crate metal;
-extern crate gfx_core;
-extern crate gfx_device_metal;
+extern crate metal_rs as metal;
+extern crate gfx_core as core;
+extern crate gfx_device_metal as device_metal;
 
 use winit::os::macos::WindowExt;
 
-use objc::runtime::{Object, Class, BOOL, YES, NO};
+use objc::runtime::{YES};
 
 use cocoa::base::id as cocoa_id;
-use cocoa::base::{selector, class};
-use cocoa::foundation::{NSUInteger, NSSize};
-use cocoa::appkit::{NSApp,
-                    NSApplication, NSApplicationActivationPolicyRegular,
-                    NSWindow, NSTitledWindowMask, NSBackingStoreBuffered,
-                    NSMenu, NSMenuItem, NSRunningApplication, NSView,
-                    NSApplicationActivateIgnoringOtherApps};
+//use cocoa::base::{selector, class};
+use cocoa::foundation::{NSSize};
+use cocoa::appkit::{NSWindow, NSView};
 
-use gfx_core::tex::Size;
-use gfx_core::format::{RenderFormat, Format};
-use gfx_core::handle::{RawRenderTargetView, RenderTargetView};
+use core::format::{RenderFormat, Format};
+use core::handle::{RawRenderTargetView, RenderTargetView};
+use core::memory::Typed;
 
-use gfx_device_metal::{Device, Factory, Resources};
+use device_metal::{Device, Factory, Resources};
 
 use metal::*;
 
-use winit::{Window};
+//use winit::{Window};
 
 use std::ops::Deref;
 use std::cell::Cell;
@@ -55,7 +51,8 @@ pub struct MetalWindow {
     window: winit::Window,
     layer: CAMetalLayer,
     drawable: *mut CAMetalDrawable,
-    backbuffer: *mut MTLTexture
+    backbuffer: *mut MTLTexture,
+    pool: Cell<NSAutoreleasePool>
 }
 
 impl Deref for MetalWindow {
@@ -68,20 +65,15 @@ impl Deref for MetalWindow {
 
 impl MetalWindow {
     pub fn swap_buffers(&self) -> Result<(), ()> {
-        // FIXME: release drawable before swapping
         // TODO: did we fail to swap buffers?
         // TODO: come up with alternative to this hack
 
         unsafe {
-            //self.pool.get().drain();
-            //self.pool.set(NSAutoreleasePool::alloc().init());
+            self.pool.get().release();
+            self.pool.set(NSAutoreleasePool::alloc().init());
 
             let drawable = self.layer.next_drawable().unwrap();
             //drawable.retain();
-
-            if !(*self.drawable).is_null() {
-                (*self.drawable).release();
-            }
 
             *self.drawable = drawable;
 
@@ -103,33 +95,34 @@ pub enum InitError {
     DriverType,
 }
 
-pub fn init<C: RenderFormat>(title: &str, requested_width: u32, requested_height: u32)
+pub fn init<C: RenderFormat>(wb: winit::WindowBuilder)
         -> Result<(MetalWindow, Device, Factory, RenderTargetView<Resources, C>), InitError>
 {
-    use gfx_core::factory::Typed;
-
-    init_raw(title, requested_width, requested_height, C::get_format())
+    init_raw(wb, C::get_format())
         .map(|(window, device, factory, color)| (window, device, factory, Typed::new(color)))
 }
 
 /// Initialize with a given size. Raw format version.
-pub fn init_raw(title: &str, requested_width: u32, requested_height: u32, color_format: Format)
+pub fn init_raw(wb: winit::WindowBuilder, color_format: Format)
         -> Result<(MetalWindow, Device, Factory, RawRenderTargetView<Resources>), InitError>
 {
-    let winit_window = winit::WindowBuilder::new()
-        .with_dimensions(requested_width, requested_height)
-        .with_title(title.to_string()).build().unwrap();
+    use device_metal::map_format;
+
+    let winit_window = wb.build().unwrap();
 
     unsafe {
         let wnd: cocoa_id = mem::transmute(winit_window.get_nswindow());
 
-        let layer = CAMetalLayer::layer();
-        layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        /*layer.set_pixel_format(match gfx_device_metal::map_format(color_format, true) {
+        let layer = CAMetalLayer::new();
+        layer.set_pixel_format(match map_format(color_format, true) {
             Some(fm) => fm,
             None => return Err(InitError::Format(color_format)),
-        });*/
+        });
         let draw_size = winit_window.get_inner_size().unwrap();
+        layer.set_edge_antialiasing_mask(0);
+        layer.set_masks_to_bounds(true);
+        //layer.set_magnification_filter(kCAFilterNearest);
+        //layer.set_minification_filter(kCAFilterNearest);
         layer.set_drawable_size(NSSize::new(draw_size.0 as f64, draw_size.1 as f64));
         layer.set_presents_with_transaction(false);
         layer.remove_all_animations();
@@ -138,17 +131,17 @@ pub fn init_raw(title: &str, requested_width: u32, requested_height: u32, color_
         view.setWantsLayer(YES);
         view.setLayer(mem::transmute(layer.0));
 
-        let (mut device, factory, color, daddr, addr) = gfx_device_metal::create(color_format, draw_size.0, draw_size.1).unwrap();
+        let (device, factory, color, daddr, addr) = device_metal::create(color_format, draw_size.0, draw_size.1).unwrap();
         layer.set_device(device.device);
 
         let drawable = layer.next_drawable().unwrap();
-
 
         let window = MetalWindow {
             window: winit_window,
             layer: layer,
             drawable: daddr,
-            backbuffer: addr
+            backbuffer: addr,
+            pool: Cell::new(NSAutoreleasePool::alloc().init())
         };
 
         (*daddr).0 = drawable.0;

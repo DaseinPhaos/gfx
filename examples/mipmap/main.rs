@@ -16,6 +16,7 @@
 extern crate gfx;
 extern crate gfx_app;
 
+use gfx::texture;
 pub use gfx::format::Depth;
 pub use gfx_app::ColorFormat;
 
@@ -66,7 +67,8 @@ struct App<R: gfx::Resources> {
 }
 
 impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
-    fn new<F: gfx::Factory<R>>(mut factory: F, init: gfx_app::Init<R>) -> Self {
+    fn new<F: gfx::Factory<R>>(factory: &mut F, backend: gfx_app::shade::Backend,
+           window_targets: gfx_app::WindowTargets<R>) -> Self {
         use gfx::traits::FactoryExt;
 
         let vs = gfx_app::shade::Source {
@@ -93,26 +95,26 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         ];
         let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, ());
 
-        let (_, texture_view) = factory.create_texture_const::<ColorFormat>(
-            gfx::tex::Kind::D2(4, 4, gfx::tex::AaMode::Single),
+        let (_, texture_view) = factory.create_texture_immutable::<ColorFormat>(
+            texture::Kind::D2(4, 4, texture::AaMode::Single),
             &[&L0_DATA, &L1_DATA, &L2_DATA]
             ).unwrap();
 
-        let sampler = factory.create_sampler(gfx::tex::SamplerInfo::new(
-            gfx::tex::FilterMethod::Trilinear,
-            gfx::tex::WrapMode::Tile,
+        let sampler = factory.create_sampler(texture::SamplerInfo::new(
+            texture::FilterMethod::Trilinear,
+            texture::WrapMode::Tile,
         ));
 
         App {
             pso: factory.create_pipeline_simple(
-                vs.select(init.backend).unwrap(),
-                fs.select(init.backend).unwrap(),
+                vs.select(backend).unwrap(),
+                fs.select(backend).unwrap(),
                 pipe::new()
                 ).unwrap(),
             data: pipe::Data {
                 vbuf: vbuf,
                 tex: (texture_view, sampler),
-                out: init.color,
+                out: window_targets.color,
             },
             slice: slice,
         }
@@ -122,9 +124,13 @@ impl<R: gfx::Resources> gfx_app::Application<R> for App<R> {
         encoder.clear(&self.data.out, [0.1, 0.2, 0.3, 1.0]);
         encoder.draw(&self.slice, &self.pso, &self.data);
     }
+
+    fn on_resize(&mut self, window_targets: gfx_app::WindowTargets<R>) {
+        self.data.out = window_targets.color;
+    }
 }
 
 pub fn main() {
     use gfx_app::Application;
-    App::launch_default("Mipmap example");
+    App::launch_simple("Mipmap example");
 }

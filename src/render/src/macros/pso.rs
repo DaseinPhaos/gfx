@@ -19,7 +19,7 @@ macro_rules! gfx_pipeline_inner {
     {
         $( $field:ident: $ty:ty, )*
     } => {
-        use $crate::pso::{DataLink, DataBind, Descriptor, InitError, RawDataSet};
+        use $crate::pso::{DataLink, DataBind, Descriptor, InitError, RawDataSet, AccessInfo};
 
         #[derive(Clone, Debug)]
         pub struct Data<R: $crate::Resources> {
@@ -36,11 +36,21 @@ macro_rules! gfx_pipeline_inner {
 
         impl<'a> $crate::pso::PipelineInit for Init<'a> {
             type Meta = Meta;
-            fn link_to(&self, desc: &mut Descriptor, info: &$crate::ProgramInfo) -> Result<Self::Meta, InitError> {
+            fn link_to<'s>(&self, desc: &mut Descriptor, info: &'s $crate::ProgramInfo)
+                       -> Result<Self::Meta, InitError<&'s str>>
+            {
                 let mut meta = Meta {
                     $( $field: <$ty as DataLink<'a>>::new(), )*
                 };
                 // v#
+                let mut _num_vb = 0;
+                $(
+                    if let Some(d) = meta.$field.link_vertex_buffer(_num_vb, &self.$field) {
+                        assert!(meta.$field.is_active());
+                        desc.vertex_buffers[_num_vb as usize] = Some(d);
+                        _num_vb += 1;
+                    }
+                )*
                 for at in &info.vertex_attributes {
                     $(
                         match meta.$field.link_input(at, &self.$field) {
@@ -50,28 +60,29 @@ macro_rules! gfx_pipeline_inner {
                                 continue;
                             },
                             Some(Err(fm)) => return Err(
-                                InitError::VertexImport(at.slot, Some(fm))
+                                InitError::VertexImport(&at.name, Some(fm))
                             ),
                             None => (),
                         }
                     )*
-                    return Err(InitError::VertexImport(at.slot, None));
+                    return Err(InitError::VertexImport(&at.name, None));
                 }
                 // c#
                 for cb in &info.constant_buffers {
                     $(
                         match meta.$field.link_constant_buffer(cb, &self.$field) {
-                            Some(Ok(())) => {
+                            Some(Ok(d)) => {
                                 assert!(meta.$field.is_active());
+                                desc.constant_buffers[cb.slot as usize] = Some(d);
                                 continue;
                             },
-                            Some(Err(_)) => return Err(
-                                InitError::ConstantBuffer(cb.slot, Some(()))
+                            Some(Err(e)) => return Err(
+                                InitError::ConstantBuffer(&cb.name, Some(e))
                             ),
                             None => (),
                         }
                     )*
-                    return Err(InitError::ConstantBuffer(cb.slot, None));
+                    return Err(InitError::ConstantBuffer(&cb.name, None));
                 }
                 // global constants
                 for gc in &info.globals {
@@ -82,57 +93,60 @@ macro_rules! gfx_pipeline_inner {
                                 continue;
                             },
                             Some(Err(_)) => return Err(
-                                InitError::GlobalConstant(gc.location, Some(()))
+                                InitError::GlobalConstant(&gc.name, Some(()))
                             ),
                             None => (),
                         }
                     )*
-                    return Err(InitError::GlobalConstant(gc.location, None));
+                    return Err(InitError::GlobalConstant(&gc.name, None));
                 }
                 // t#
                 for srv in &info.textures {
                     $(
                         match meta.$field.link_resource_view(srv, &self.$field) {
-                            Some(Ok(())) => {
+                            Some(Ok(d)) => {
                                 assert!(meta.$field.is_active());
+                                desc.resource_views[srv.slot as usize] = Some(d);
                                 continue;
                             },
                             Some(Err(_)) => return Err(
-                                InitError::ResourceView(srv.slot, Some(()))
+                                InitError::ResourceView(&srv.name, Some(()))
                             ),
                             None => (),
                         }
                     )*
-                    return Err(InitError::ResourceView(srv.slot, None));
+                    return Err(InitError::ResourceView(&srv.name, None));
                 }
                 // u#
                 for uav in &info.unordereds {
                     $(
                         match meta.$field.link_unordered_view(uav, &self.$field) {
-                            Some(Ok(())) => {
+                            Some(Ok(d)) => {
                                 assert!(meta.$field.is_active());
+                                desc.unordered_views[uav.slot as usize] = Some(d);
                                 continue;
                             },
                             Some(Err(_)) => return Err(
-                                InitError::UnorderedView(uav.slot, Some(()))
+                                InitError::UnorderedView(&uav.name, Some(()))
                             ),
                             None => (),
                         }
                     )*
-                    return Err(InitError::UnorderedView(uav.slot, None));
+                    return Err(InitError::UnorderedView(&uav.name, None));
                 }
                 // s#
                 for sm in &info.samplers {
                     $(
                         match meta.$field.link_sampler(sm, &self.$field) {
-                            Some(()) => {
+                            Some(d) => {
                                 assert!(meta.$field.is_active());
+                                desc.samplers[sm.slot as usize] = Some(d);
                                 continue;
                             },
                             None => (),
                         }
                     )*
-                    return Err(InitError::Sampler(sm.slot, None));
+                    return Err(InitError::Sampler(&sm.name, None));
                 }
                 // color targets
                 for out in &info.outputs {
@@ -144,12 +158,12 @@ macro_rules! gfx_pipeline_inner {
                                 continue;
                             },
                             Some(Err(fm)) => return Err(
-                                InitError::PixelExport(out.slot, Some(fm))
+                                InitError::PixelExport(&out.name, Some(fm))
                             ),
                             None => (),
                         }
                     )*
-                    return Err(InitError::PixelExport(out.slot, None));
+                    return Err(InitError::PixelExport(&out.name, None));
                 }
                 if !info.knows_outputs {
                     use $crate::shade::core as s;
@@ -167,7 +181,7 @@ macro_rules! gfx_pipeline_inner {
                                 out.slot += 1;
                             },
                             Some(Err(fm)) => return Err(
-                                InitError::PixelExport(out.slot, Some(fm))
+                                InitError::PixelExport(&"!known", Some(fm))
                             ),
                             None => (),
                         }
@@ -193,9 +207,13 @@ macro_rules! gfx_pipeline_inner {
 
         impl<R: $crate::Resources> $crate::pso::PipelineData<R> for Data<R> {
             type Meta = Meta;
-            fn bake_to(&self, out: &mut RawDataSet<R>, meta: &Self::Meta, man: &mut $crate::handle::Manager<R>) {
+            fn bake_to(&self,
+                       out: &mut RawDataSet<R>,
+                       meta: &Self::Meta,
+                       man: &mut $crate::handle::Manager<R>,
+                       access: &mut AccessInfo<R>) {
                 $(
-                    meta.$field.bind_to(out, &self.$field, man);
+                    meta.$field.bind_to(out, &self.$field, man, access);
                 )*
             }
         }
@@ -207,10 +225,11 @@ macro_rules! gfx_pipeline_base {
     ($module:ident {
         $( $field:ident: $ty:ty, )*
     }) => {
+        #[allow(missing_docs)]
         pub mod $module {
-            use $crate;
             #[allow(unused_imports)]
             use super::*;
+            use super::gfx;
             gfx_pipeline_inner!{ $(
                 $field: $ty,
             )*}
@@ -223,10 +242,11 @@ macro_rules! gfx_pipeline {
     ($module:ident {
         $( $field:ident: $ty:ty = $value:expr, )*
     }) => {
+        #[allow(missing_docs)]
         pub mod $module {
-            use $crate;
             #[allow(unused_imports)]
             use super::*;
+            use super::gfx;
             gfx_pipeline_inner!{ $(
                 $field: $ty,
             )*}

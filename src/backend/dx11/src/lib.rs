@@ -16,7 +16,7 @@
 
 #[macro_use]
 extern crate log;
-extern crate gfx_core;
+extern crate gfx_core as core;
 extern crate d3d11;
 extern crate d3dcompiler;
 extern crate dxguid;
@@ -24,6 +24,7 @@ extern crate winapi;
 
 pub use self::command::CommandBuffer;
 pub use self::data::map_format;
+pub use self::factory::Factory;
 
 mod command;
 mod data;
@@ -72,22 +73,27 @@ pub mod native {
 }
 
 use std::cell::RefCell;
-use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
-pub use self::factory::Factory;
-use gfx_core::handle as h;
-use gfx_core::factory::Usage;
-use gfx_core::tex;
-
+use core::{handle as h, texture as tex};
+use core::SubmissionResult;
+use core::command::{AccessInfo, AccessGuard};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Buffer(native::Buffer, Usage);
+pub struct Buffer(native::Buffer);
+impl Buffer {
+    pub fn as_resource(&self) -> *mut winapi::ID3D11Resource {
+        type Res = *mut winapi::ID3D11Resource;
+        match self.0 {
+            native::Buffer(t) => t as Res,
+        }
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Texture(native::Texture, Usage);
+pub struct Texture(native::Texture);
 impl Texture {
-    pub fn to_resource(&self) -> *mut winapi::ID3D11Resource {
+    pub fn as_resource(&self) -> *mut winapi::ID3D11Resource {
         type Res = *mut winapi::ID3D11Resource;
         match self.0 {
             native::Texture::D1(t) => t as Res,
@@ -110,6 +116,8 @@ unsafe impl Sync for Shader {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Program {
     vs: *mut winapi::ID3D11VertexShader,
+    hs: *mut winapi::ID3D11HullShader,
+    ds: *mut winapi::ID3D11DomainShader,
     gs: *mut winapi::ID3D11GeometryShader,
     ps: *mut winapi::ID3D11PixelShader,
     vs_hash: u64,
@@ -123,7 +131,8 @@ pub type InputLayout = *mut winapi::ID3D11InputLayout;
 pub struct Pipeline {
     topology: winapi::D3D11_PRIMITIVE_TOPOLOGY,
     layout: InputLayout,
-    attributes: [Option<gfx_core::pso::AttributeDesc>; gfx_core::MAX_VERTEX_ATTRIBUTES],
+    vertex_buffers: [Option<core::pso::VertexBufferDesc>; core::pso::MAX_VERTEX_BUFFERS],
+    attributes: [Option<core::pso::AttributeDesc>; core::MAX_VERTEX_ATTRIBUTES],
     program: Program,
     rasterizer: *const winapi::ID3D11RasterizerState,
     depth_stencil: *const winapi::ID3D11DepthStencilState,
@@ -135,7 +144,7 @@ unsafe impl Sync for Pipeline {}
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Resources {}
 
-impl gfx_core::Resources for Resources {
+impl core::Resources for Resources {
     type Buffer              = Buffer;
     type Shader              = Shader;
     type Program             = Program;
@@ -146,13 +155,14 @@ impl gfx_core::Resources for Resources {
     type ShaderResourceView  = native::Srv;
     type UnorderedAccessView = ();
     type Sampler             = native::Sampler;
-    type Fence               = ();
+    type Fence               = Fence;
+    type Mapping             = factory::MappingGate;
 }
 
 /// Internal struct of shared data between the device and its factories.
 #[doc(hidden)]
 pub struct Share {
-    capabilities: gfx_core::Capabilities,
+    capabilities: core::Capabilities,
     handles: RefCell<h::Manager<Resources>>,
 }
 
@@ -170,19 +180,17 @@ static FEATURE_LEVELS: [winapi::D3D_FEATURE_LEVEL; 3] = [
     winapi::D3D_FEATURE_LEVEL_10_0,
 ];
 
-
-pub fn create(driver_type: winapi::D3D_DRIVER_TYPE, desc: &winapi::DXGI_SWAP_CHAIN_DESC, format: gfx_core::format::Format)
-              -> Result<(Device, Factory, *mut winapi::IDXGISwapChain, h::RawRenderTargetView<Resources>), winapi::HRESULT> {
-    use gfx_core::handle::Producer;
-
+pub fn create(driver_type: winapi::D3D_DRIVER_TYPE, desc: &winapi::DXGI_SWAP_CHAIN_DESC)
+              -> Result<(Device, Factory, *mut winapi::IDXGISwapChain), winapi::HRESULT> {
     let mut swap_chain = ptr::null_mut();
     let create_flags = winapi::D3D11_CREATE_DEVICE_FLAG(0); //D3D11_CREATE_DEVICE_DEBUG;
     let mut device = ptr::null_mut();
     let share = Share {
-        capabilities: gfx_core::Capabilities {
+        capabilities: core::Capabilities {
             max_vertex_count: 0,
             max_index_count: 0,
             max_texture_size: 0,
+            max_patch_size: 32, //hard-coded in D3D11
             instance_base_supported: false,
             instance_call_supported: false,
             instance_rate_supported: false,
@@ -191,6 +199,7 @@ pub fn create(driver_type: winapi::D3D_DRIVER_TYPE, desc: &winapi::DXGI_SWAP_CHA
             constant_buffer_supported: true,
             unordered_access_view_supported: false,
             separate_blending_slots_supported: false,
+            copy_buffer_supported: true,
         },
         handles: RefCell::new(h::Manager::new()),
     };
@@ -206,20 +215,6 @@ pub fn create(driver_type: winapi::D3D_DRIVER_TYPE, desc: &winapi::DXGI_SWAP_CHA
         return Err(hr)
     }
 
-    let mut back_buffer: *mut winapi::ID3D11Texture2D = ptr::null_mut();
-    unsafe {
-        (*swap_chain).GetBuffer(0, &dxguid::IID_ID3D11Texture2D, &mut back_buffer
-            as *mut *mut winapi::ID3D11Texture2D as *mut *mut c_void);
-    }
-    let raw_tex = Texture(native::Texture::D2(back_buffer), Usage::GpuOnly);
-    let color_tex = share.handles.borrow_mut().make_texture(raw_tex, tex::Descriptor {
-        kind: tex::Kind::D2(desc.BufferDesc.Width as tex::Size, desc.BufferDesc.Height as tex::Size, tex::AaMode::Single),
-        levels: 1,
-        format: format.0,
-        bind: gfx_core::factory::RENDER_TARGET,
-        usage: raw_tex.1,
-    });
-
     let dev = Device {
         context: context,
         feature_level: feature_level,
@@ -227,19 +222,9 @@ pub fn create(driver_type: winapi::D3D_DRIVER_TYPE, desc: &winapi::DXGI_SWAP_CHA
         frame_handles: h::Manager::new(),
         max_resource_count: None,
     };
-    let mut factory = Factory::new(device, dev.share.clone());
+    let factory = Factory::new(device, dev.share.clone());
 
-    let color_target = {
-        use gfx_core::Factory;
-        let desc = tex::RenderDesc {
-            channel: format.1,
-            level: 0,
-            layer: None,
-        };
-        factory.view_texture_as_render_target_raw(&color_tex, desc).unwrap()
-    };
-
-    Ok((dev, factory, swap_chain, color_target))
+    Ok((dev, factory, swap_chain))
 }
 
 pub type ShaderModel = u16;
@@ -258,8 +243,22 @@ impl Device {
             },
         }
     }
-}
 
+    pub fn before_submit<'a>(&mut self, gpu_access: &'a AccessInfo<Resources>)
+                             -> core::SubmissionResult<AccessGuard<'a, Resources>> {
+        let mut gpu_access = try!(gpu_access.take_accesses());
+        for (buffer, mut mapping) in gpu_access.access_mapped() {
+            factory::ensure_unmapped(&mut mapping, buffer, self.context);
+        }
+        Ok(gpu_access)
+    }
+
+    pub fn clear_state(&self) {
+        unsafe {
+            (*self.context).ClearState();
+        }
+    }
+}
 
 pub struct CommandList(Vec<command::Command>, command::DataBuffer);
 impl CommandList {
@@ -268,9 +267,6 @@ impl CommandList {
     }
 }
 impl command::Parser for CommandList {
-    fn clone_empty(&self) -> CommandList {
-        CommandList(Vec::with_capacity(self.0.capacity()), command::DataBuffer::new())
-    }
     fn reset(&mut self) {
         self.0.clear();
         self.1.reset();
@@ -289,6 +285,7 @@ impl command::Parser for CommandList {
 }
 
 pub struct DeferredContext(*mut winapi::ID3D11DeviceContext, Option<*mut winapi::ID3D11CommandList>);
+unsafe impl Send for DeferredContext {}
 impl DeferredContext {
     pub fn new(dc: *mut winapi::ID3D11DeviceContext) -> DeferredContext {
         DeferredContext(dc, None)
@@ -300,10 +297,6 @@ impl Drop for DeferredContext {
     }
 }
 impl command::Parser for DeferredContext {
-    fn clone_empty(&self) -> DeferredContext {
-        unsafe { (*self.0).AddRef() };
-        DeferredContext(self.0, None)
-    }
     fn reset(&mut self) {
         if let Some(cl) = self.1 {
             unsafe { (*cl).Release() };
@@ -326,11 +319,11 @@ impl command::Parser for DeferredContext {
 }
 
 
-impl gfx_core::Device for Device {
+impl core::Device for Device {
     type Resources = Resources;
     type CommandBuffer = command::CommandBuffer<CommandList>;
 
-    fn get_capabilities(&self) -> &gfx_core::Capabilities {
+    fn get_capabilities(&self) -> &core::Capabilities {
         &self.share.capabilities
     }
 
@@ -345,27 +338,56 @@ impl gfx_core::Device for Device {
         }
     }
 
-    fn submit(&mut self, cb: &mut Self::CommandBuffer) {
+    fn submit(&mut self,
+              cb: &mut Self::CommandBuffer,
+              access: &AccessInfo<Resources>) -> SubmissionResult<()>
+    {
+        let _guard = try!(self.before_submit(access));
         unsafe { (*self.context).ClearState(); }
         for com in &cb.parser.0 {
             execute::process(self.context, com, &cb.parser.1);
         }
+        Ok(())
+    }
+
+    fn fenced_submit(&mut self,
+                     _: &mut Self::CommandBuffer,
+                     _: &AccessInfo<Resources>,
+                     _after: Option<h::Fence<Resources>>)
+                     -> SubmissionResult<h::Fence<Resources>>
+    {
+        unimplemented!()
+    }
+
+    fn wait_fence(&mut self, _fence: &h::Fence<Self::Resources>) {
+        unimplemented!()
     }
 
     fn cleanup(&mut self) {
-        use gfx_core::handle::Producer;
+        use core::handle::Producer;
+
         self.frame_handles.clear();
-        self.share.handles.borrow_mut().clean_with(&mut (),
-            |_, v| unsafe { (*(v.0).0).Release(); }, //buffer
+        self.share.handles.borrow_mut().clean_with(&mut self.context,
+            |ctx, buffer| {
+                buffer.mapping().map(|raw| {
+                    // we have exclusive access because it's the last reference
+                    let mut mapping = unsafe { raw.use_access() };
+                    factory::ensure_unmapped(&mut mapping, buffer, *ctx);
+                });
+                unsafe { (*(buffer.resource().0).0).Release(); }
+            },
             |_, s| unsafe { //shader
                 (*s.object).Release();
                 (*s.reflection).Release();
             },
-            |_, p| unsafe {
+            |_, program| unsafe {
+                let p = program.resource();
                 if p.vs != ptr::null_mut() { (*p.vs).Release(); }
+                if p.hs != ptr::null_mut() { (*p.hs).Release(); }
+                if p.ds != ptr::null_mut() { (*p.ds).Release(); }
                 if p.gs != ptr::null_mut() { (*p.gs).Release(); }
                 if p.ps != ptr::null_mut() { (*p.ps).Release(); }
-            }, //program
+            },
             |_, v| unsafe { //PSO
                 type Child = *mut winapi::ID3D11DeviceChild;
                 (*v.layout).Release();
@@ -373,13 +395,13 @@ impl gfx_core::Device for Device {
                 (*(v.depth_stencil as Child)).Release();
                 (*(v.blend as Child)).Release();
             },
-            |_, v| unsafe { (*v.to_resource()).Release(); },  //texture
+            |_, texture| unsafe { (*texture.resource().as_resource()).Release(); },
             |_, v| unsafe { (*v.0).Release(); }, //SRV
             |_, _| {}, //UAV
             |_, v| unsafe { (*v.0).Release(); }, //RTV
             |_, v| unsafe { (*v.0).Release(); }, //DSV
             |_, v| unsafe { (*v.0).Release(); }, //sampler
-            |_, _| {}, //fence
+            |_, _fence| {},
         );
     }
 }
@@ -390,11 +412,17 @@ impl From<Device> for Deferred {
         Deferred(device)
     }
 }
-impl gfx_core::Device for Deferred {
+impl Deferred {
+    pub fn clear_state(&self) {
+        self.0.clear_state();
+    }
+}
+
+impl core::Device for Deferred {
     type Resources = Resources;
     type CommandBuffer = command::CommandBuffer<DeferredContext>;
 
-    fn get_capabilities(&self) -> &gfx_core::Capabilities {
+    fn get_capabilities(&self) -> &core::Capabilities {
         &self.0.share.capabilities
     }
 
@@ -402,7 +430,11 @@ impl gfx_core::Device for Deferred {
         self.0.pin_submitted_resources(man);
     }
 
-    fn submit(&mut self, cb: &mut Self::CommandBuffer) {
+    fn submit(&mut self,
+              cb: &mut Self::CommandBuffer,
+              access: &AccessInfo<Resources>) -> SubmissionResult<()>
+    {
+        let _guard = try!(self.0.before_submit(access));
         let cl = match cb.parser.1 {
             Some(cl) => cl,
             None => {
@@ -425,9 +457,26 @@ impl gfx_core::Device for Deferred {
             },
             _ => (),
         }
+        Ok(())
+    }
+
+    fn fenced_submit(&mut self,
+                     _: &mut Self::CommandBuffer,
+                     _: &AccessInfo<Resources>,
+                     _after: Option<h::Fence<Resources>>)
+                     -> SubmissionResult<h::Fence<Resources>>
+    {
+        unimplemented!()
+    }
+
+    fn wait_fence(&mut self, _fence: &h::Fence<Self::Resources>) {
+        unimplemented!()
     }
 
     fn cleanup(&mut self) {
         self.0.cleanup();
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Fence(());
